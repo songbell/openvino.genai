@@ -8,7 +8,7 @@
 
 #include "openvino/runtime/tensor.hpp"
 #include "paged_attention_transformations.hpp"
-
+#include "utils.hpp"
 namespace ov::genai {
 
 class CacheManager {
@@ -156,7 +156,7 @@ public:
                 update_request_tensor(decoder_layer_id);
             }
         } else {
-            auto remote_context = m_request.get_compiled_model().get_context();
+            auto remote_context =  utils::singleton_core().get_default_context(m_device);
 
             for (size_t decoder_layer_id = 0; decoder_layer_id < m_num_decoder_layers; ++decoder_layer_id) {
                 ov::Shape value_cache_shape = set_kv_blocks(m_value_shapes[decoder_layer_id], num_kv_blocks);
