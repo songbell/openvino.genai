@@ -457,6 +457,7 @@ class Sampler::TopKSelector {
     std::vector<Beam> m_beams;
     ov::genai::GenerationConfig m_parameters;
     int64_t* m_d2t; // Draft-to-target token ID offset
+    std::map<int64_t, int64_t> m_candidates_per_seq;
 
 public:
     explicit TopKSelector(SequenceGroup::Ptr sequence_group, ov::Tensor d2t);
@@ -467,5 +468,13 @@ public:
     // return std::ext(-m_parameter.eagle_layer_decay * (layer - 1));
     //}
     void apply_eagle2_scoring() {}  // to be implemented
+    void set_candidates_per_seq(int64_t seq_id, int64_t candidate_num) {
+        auto iter = m_candidates_per_seq.find(seq_id);
+        if (iter == m_candidates_per_seq.end()) {
+            m_candidates_per_seq[seq_id] = candidate_num;
+        } else {
+            iter->second += candidate_num;
+        }
+    }
 };
 }  // namespace ov::genai

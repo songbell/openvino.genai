@@ -6,6 +6,8 @@
 #include "sampling/sampler.hpp"
 #include "tokenizer/tokenizer_impl.hpp"
 
+#define OPTIMIZATION 0
+
 namespace ov::genai {
 // Modified Knuth–Morris–Pratt algorithm which returns tokens following after every needle occurrence in haystack
 std::vector<int64_t> kmp_search(const std::vector<int64_t>& haystack, const std::vector<int64_t>& needle) {
@@ -669,7 +671,7 @@ align_all_sequence_len(SequenceGroup::Ptr& sequence_group,
     }
     logit_processor.update_generated_len(min_generated_tokens);
 }
-
+#if OPTIMIZATION
 void pad_sequence_lengths(SequenceGroup::Ptr& sequence_group) {
     auto running_sequences = sequence_group->get_running_sequences();
     if (running_sequences.empty()) {
@@ -687,6 +689,57 @@ void pad_sequence_lengths(SequenceGroup::Ptr& sequence_group) {
         }
     }
 }
+#else
+void pad_sequence_lengths(SequenceGroup::Ptr& sequence_group, SamplerOutput& sampler_output, std::map<int64_t, int64_t>& candidate_per_seq) {
+    auto running_sequences = sequence_group->get_running_sequences();
+    if (running_sequences.empty()) {
+        return;
+    }
+    size_t max_candidate_depth = 0;
+    size_t max_token_per_seq = 5;
+    size_t max_seq_num = 13;
+    size_t max_token_num = max_seq_num * max_token_per_seq;
+    size_t current_seq_num = running_sequences.size();
+
+    for (auto& candidates : candidate_per_seq) {
+        max_candidate_depth = (candidates.second > max_candidate_depth ? candidates.second : max_candidate_depth);
+    }
+
+    size_t current_token_num = current_seq_num * (max_candidate_depth + 1);
+    size_t extra_pad_tokens_num = max_candidate_depth;
+    size_t extra_pad_seq_num = max_seq_num - current_seq_num;
+    if (max_seq_num < current_seq_num) {
+        std::cout << "current_seq_num:" << current_seq_num << std::endl;
+    }
+    OPENVINO_ASSERT(current_seq_num <= max_seq_num, "[warning] current running sequence num is greater than max running sequence");
+
+    auto first_sequence = sequence_group->get_running_sequences()[0];
+    auto candidate_num = candidate_per_seq[first_sequence->get_id()];
+    auto generated_len = first_sequence->get_generated_len();
+    for (size_t i = 0; i < extra_pad_seq_num; i++) {
+        auto forked_sequence = sequence_group->fork_sequence(first_sequence);
+        forked_sequence->set_status(SequenceStatus::RUNNING);
+        forked_sequence->remove_last_tokens(forked_sequence->get_generated_ids().size());
+        for (size_t j = 0; j < generated_len - candidate_num + max_token_per_seq - 1; j++) {
+            forked_sequence->append_token(-1, 0.0f);
+        }
+
+        // fill out sampler output
+        sampler_output.m_forked_sequences[first_sequence->get_id()].push_back(forked_sequence->get_id());
+    }
+
+    for (auto& seq : running_sequences) {
+        auto iter = candidate_per_seq.find(seq->get_id());
+        if (iter == candidate_per_seq.end()) {
+            std::cout << "can not find running seqence id:" << seq->get_id() << " in candidate_per_seq" << std::endl;
+        } else {
+            for (auto i = 0; i < max_token_per_seq - 1 - iter->second; i++) {
+                seq->append_token(-1, 0.0f);
+            }
+        }
+    }
+}
+#endif
 
 void adjust_sequence_to_match_path(Sequence::Ptr sequence,
                                    const std::vector<int64_t>& target_path,
@@ -1180,6 +1233,7 @@ void Sampler::TopKSelector::tree_reset(SequenceGroup::Ptr& sequence_group) {
                                                                         m_parameters.eagle_tree_params.total_tokens - 1,
                                                                         m_parameters.eagle_tree_params.tree_depth);
     m_beams.push_back(root_beam);
+    m_candidates_per_seq.clear();
 
 }
 
@@ -1201,12 +1255,18 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
             retrieve_indices.push_back(path);
         }
     }
+
+    std::sort(retrieve_indices.begin(), retrieve_indices.end(), [](const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
+        return a.size() > b.size();
+    });
+
     for (Beam& child_beam : child_beams) {
         uint64_t parent_sequence_id = child_beam.m_sequence->get_id();
         uint64_t& num_childs = parent_2_num_childs_map[parent_sequence_id];
 
         // if current beam is forked multiple times
         if (num_childs > 1) {
+            auto base_candidates_num = m_candidates_per_seq[child_beam.m_sequence->get_id()];
             child_beam.m_sequence = m_sequence_group->fork_sequence(child_beam.m_sequence);
             child_beam.m_sequence->set_status(SequenceStatus::RUNNING);
             child_beam.m_sequence->append_token(child_beam.m_token_id, child_beam.m_log_prob);
@@ -1217,10 +1277,12 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
 
             // fill out sampler output
             sampler_output.m_forked_sequences[parent_sequence_id].push_back(child_beam.m_sequence->get_id());
+            set_candidates_per_seq(child_beam.m_sequence->get_id(), base_candidates_num + 1);
         } else if (num_childs == 1) {
             // keep current sequence going and add a new token
             child_beam.m_sequence->set_status(SequenceStatus::RUNNING);
             child_beam.m_sequence->append_token(child_beam.m_token_id, child_beam.m_log_prob);
+            set_candidates_per_seq(child_beam.m_sequence->get_id(), 1);
         }
     }
 
@@ -1247,11 +1309,15 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
             if (generated_ids.size() < path.size()) {
                 continue;  // cannot match if generated ids are shorter than path
             }
+#if OPTIMIZATION
             auto adjust_len = max_num_generated_token - seq->get_generated_len();
             int start_idx = generated_ids.size() - (m_parameters.eagle_tree_params.tree_depth) + adjust_len;
             if (start_idx < 0) {
                 start_idx = 0; // ensure we do not go out of bounds
             }
+#else
+            int start_idx = generated_ids.size() - m_candidates_per_seq[seq->get_id()];
+#endif
             auto iter = std::search(generated_ids.begin() + start_idx, generated_ids.end(), path.begin(), path.end());
             if (iter != generated_ids.end()) {
                 size_t tokens_to_remove = std::distance(iter, generated_ids.end()) - path.size();
@@ -1259,6 +1325,7 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
                 seq->set_status(SequenceStatus::RUNNING);
                 used_sequences.push_back(seq);
                 used_sequence_ids.insert(seq->get_id());
+                set_candidates_per_seq(seq->get_id(), 0 - tokens_to_remove);
 
                 available_sequences.erase(it);
                 found_exact_match = true;
@@ -1283,11 +1350,15 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
             if (generated_ids.empty()) {
                 continue;
             }
+#if OPTIMIZATIION
             auto adjust_len = max_num_generated_token - seq->get_generated_len();
             int start_idx = generated_ids.size() - (m_parameters.eagle_tree_params.tree_depth) + adjust_len;
             if (start_idx < 0) {
                 start_idx = 0; // ensure we do not go out of bounds
             }
+#else
+            int start_idx = generated_ids.size() - m_candidates_per_seq[seq->get_id()];
+#endif
             for (size_t start_pos = start_idx; start_pos <= generated_ids.size() - 1; ++start_pos) {
                 size_t common_length = 0;
                 
@@ -1330,6 +1401,7 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
                     parent_id = child_2_parent_map[parent_id];
                 }
                 sampler_output.m_forked_sequences[parent_id].push_back(forked_sequence->get_id());
+                set_candidates_per_seq(forked_sequence->get_id(), m_candidates_per_seq[best_match->get_id()]);
             }
             // Mark the sequence as running and used
             best_match->set_status(SequenceStatus::RUNNING);
@@ -1345,7 +1417,7 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
             // For now, let's just ensure the token sequence matches the path
             // by removing any extra tokens and adding missing ones
             size_t current_length = best_match->get_generated_ids().size();
-            
+#if OPTIMIZATION
             // Remove tokens if needed (if sequence is longer than path)
             if (current_length - best_match_start_pos > path.size()) {
                 size_t tokens_to_remove = current_length - path.size();
@@ -1357,12 +1429,29 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
                 // Append missing tokens
                 best_match->append_token(path[i + max_common_length], 0.0f);  // Using 0.0f as default log_prob, as I do not care the prob later
             }
+#else
+            if (current_length - best_match_start_pos > max_common_length) {
+                size_t tokens_to_remove = current_length - best_match_start_pos - max_common_length;
+                best_match->remove_last_tokens(tokens_to_remove);
+                set_candidates_per_seq(best_match->get_id(), 0 - tokens_to_remove);
+            }
+
+            // append tokens to match the path
+            for (size_t i = 0; i < path.size() - max_common_length; ++i) {
+                // Append missing tokens
+                best_match->append_token(path[i + max_common_length], 0.0f);  // Using 0.0f as default log_prob, as I do not care the prob later
+                set_candidates_per_seq(best_match->get_id(), 1);
+            }
+#endif
         } else {
             std::cout << "No matching sequence found for a path of length " << path.size() << std::endl;
         }
     }
-
+#if OPTIMIZATION
     pad_sequence_lengths(m_sequence_group);
+#else
+    pad_sequence_lengths(m_sequence_group, sampler_output, m_candidates_per_seq);
+#endif
     // drop all waiting sequences
     auto seqs = m_sequence_group->get_sequences();
     for (auto& seq : seqs) {
@@ -1494,6 +1583,7 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
 
             // if current beam is forked multiple times
             if (num_childs > 1) {
+                auto base_candidates_num = m_candidates_per_seq[child_beam.m_sequence->get_id()];
                 child_beam.m_sequence = m_sequence_group->fork_sequence(child_beam.m_sequence);
                 child_beam.m_sequence->append_token(child_beam.m_token_id, child_beam.m_log_prob);
 
@@ -1503,9 +1593,11 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
 
                 // fill out sampler output
                 sampler_output.m_forked_sequences[parent_sequence_id].push_back(child_beam.m_sequence->get_id());
+                set_candidates_per_seq(child_beam.m_sequence->get_id(), base_candidates_num + 1);
             } else if (num_childs == 1) {
                 // keep current sequence going and add a new token
                 child_beam.m_sequence->append_token(child_beam.m_token_id, child_beam.m_log_prob);
+                set_candidates_per_seq(child_beam.m_sequence->get_id(), 1);
             }
         }
 
