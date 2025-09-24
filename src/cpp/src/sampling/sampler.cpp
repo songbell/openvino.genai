@@ -1422,9 +1422,11 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
         using Pair = std::pair<float, size_t>;
         auto cmp = [](const Pair& a, const Pair& b) { return a.first > b.first; };
         std::priority_queue<Pair, std::vector<Pair>, decltype(cmp)> minHeap(cmp);
-
+        auto branching_factor = m_tree_layer_counter == 1 ? 
+                                m_parameters.eagle_tree_params.branching_factor : 
+                                1;
         for (size_t i = 0; i < vocab_size; ++i) {
-            if (minHeap.size() < m_parameters.eagle_tree_params.branching_factor) {
+            if (minHeap.size() < branching_factor) {
                 minHeap.emplace(beam_logits[i], i);
             } else if (beam_logits[i] > minHeap.top().first) {
                 minHeap.pop();
@@ -1475,12 +1477,12 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
     // Sample 2 * group_size highest score tokens to get at least 1 non EOS token per beam
     // OPENVINO_ASSERT(candidates.size() >= 2 * group_size, "No beams left to search");
 
-    std::partial_sort(candidates.begin(),
+    /*std::partial_sort(candidates.begin(),
                       candidates.begin() + m_parameters.eagle_tree_params.branching_factor,
                       candidates.end(),
-                      greater);  // select top k of cumulative probs
+                      greater); */  // select top k of cumulative probs
     // leave the last cycle of beam selection to candidate finalization stage
-    if (m_tree_layer_counter < m_parameters.eagle_tree_params.tree_depth + 1) {
+    {
         for (size_t cand_idx = 0; cand_idx < m_parameters.eagle_tree_params.branching_factor; ++cand_idx) {
             Beam& candidate = candidates[cand_idx];
 
@@ -1520,15 +1522,10 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
 
         // child become parents
         m_beams = child_beams;
-    } else { // at this point, we already have the full candidate tree
-        // now we start the finalization of candidates and last cycle of beam selection and sequence forking
-        for (auto& iter : m_sequence_group->get_running_sequences()) { // at this point, we should have running sequence num = branching factor
-            iter->set_status(SequenceStatus::CACHING);
+        if (m_tree_layer_counter == m_parameters.eagle_tree_params.tree_depth + 1) {
+            m_tree_layer_counter = 0;  // reset counter
+            m_beams.clear();
         }
-        finalize_eagle2_candidates(sampler_output);
-        m_tree_layer_counter = 0;  // reset counter
-        m_beams.clear();
-        return;
     }
 }
 
