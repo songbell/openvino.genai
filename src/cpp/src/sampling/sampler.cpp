@@ -1402,10 +1402,14 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
         // zero out all parent forks counts
         parent_2_num_childs_map[parent_seq_id] = 0;
     }
-
     std::vector<Beam> candidates;
     std::vector<Beam> child_beams;                                       // beams for next execution in step()
     candidates.reserve(m_parameters.eagle_tree_params.branching_factor * m_beams.size());  // num_beams for each beam
+
+    auto branching_factor = m_parameters.eagle_tree_params.branching_factor - m_tree_layer_counter;
+    if (branching_factor < 1 || branching_factor > m_parameters.eagle_tree_params.branching_factor)
+        branching_factor = 1;
+
     m_tree_layer_counter++;
     for (const Beam& beam : m_beams) {
 #if 1 // optimize branch
@@ -1422,9 +1426,7 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
         using Pair = std::pair<float, size_t>;
         auto cmp = [](const Pair& a, const Pair& b) { return a.first > b.first; };
         std::priority_queue<Pair, std::vector<Pair>, decltype(cmp)> minHeap(cmp);
-        auto branching_factor = m_tree_layer_counter == 1 ? 
-                                m_parameters.eagle_tree_params.branching_factor : 
-                                1;
+
         for (size_t i = 0; i < vocab_size; ++i) {
             if (minHeap.size() < branching_factor) {
                 minHeap.emplace(beam_logits[i], i);
@@ -1483,7 +1485,7 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
                       greater); */  // select top k of cumulative probs
     // leave the last cycle of beam selection to candidate finalization stage
     {
-        for (size_t cand_idx = 0; cand_idx < m_parameters.eagle_tree_params.branching_factor; ++cand_idx) {
+        for (size_t cand_idx = 0; cand_idx < candidates.size(); ++cand_idx) {
             Beam& candidate = candidates[cand_idx];
 
             parent_2_num_childs_map[candidate.m_sequence->get_id()] += 1;

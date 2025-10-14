@@ -366,7 +366,50 @@ std::vector<SequenceGroup::Ptr> ContinuousBatchingPipeline::SpeculativeDecodingI
     return main_awaiting_requests;
 }
 // end of speculative_decoding_impl
+void share_embedding_weights(std::shared_ptr<ov::Model>& main_model, std::shared_ptr<ov::Model>& draft_model) {
+    // extract embedding weight from main model
+    auto find_embedding_gather = [](const std::shared_ptr<ov::Model>& model)
+        -> std::shared_ptr<ov::Node> {
+        for (const auto& node : model->get_ordered_ops()) {
+            auto gather = std::dynamic_pointer_cast<ov::op::util::GatherBase>(node);
+            if (!gather) continue;
+            // [vocab, hidden_size] * [batch, seq_len] -> [batch, seq_len, hidden_size]
+            auto data_node = gather->input_value(0).get_node_shared_ptr();
+            auto indices_node = gather->input_value(1).get_node_shared_ptr();
+            if (!data_node || !indices_node) continue;
+            // indices_node should be on parameter path, maybe this is better rule
+            ov::PartialShape ps = data_node->get_output_partial_shape(0);
+            if (ps.rank().is_static() && ps.rank().get_length() >= 2) {
+                if (ps[0].is_static() && ps[0].get_length() > 1000) { // Heuristic: vocab size > 1000
+                    return gather;
+                }
+            }
+            std::string fname = data_node->get_friendly_name();
+            if (fname.find("embed_tokens") != std::string::npos ||
+                fname.find("embedding") != std::string::npos) {
+                return gather;
+            }
+        }
+        return nullptr;
+    };
+    auto main_gather  = find_embedding_gather(main_model);
+    auto draft_gather = find_embedding_gather(draft_model);
+    if (!main_gather || !draft_gather) {
+        return;
+    }
+    auto main_weight_node = main_gather->input_value(0).get_node_shared_ptr();
+    auto draft_weight_node = draft_gather->input_value(0).get_node_shared_ptr();
 
+    if (main_weight_node.get() == draft_weight_node.get()) {
+        return;
+    }
+
+    try {
+        draft_weight_node->output(0).replace(main_weight_node->output(0));
+    } catch (...) {
+        std::cout << "fail to import embedding weights from main model to draft model" << std::endl;
+    }
+}
 void extract_hidden_state_generic(std::shared_ptr<ov::Model>& model,
                                                        const std::string& eagle_version,
                                                        const std::string& model_type,
@@ -786,6 +829,7 @@ ContinuousBatchingPipeline::EagleDecodingImpl::EagleDecodingImpl(const ov::genai
     // apply transformations needed to run eagle model
     // target model: hidden state extraction, draft model: hidden state import , hidden state extraction
     // eagle3 specific : dt importing
+    share_embedding_weights(main_model, draft_model);
     extract_hidden_state_generic(main_model, m_eagle_version, "main", "");
     extract_hidden_state_generic(draft_model, m_eagle_version, "draft", "");
     ov::serialize(draft_model, "bell_after.xml");

@@ -682,6 +682,7 @@ UpdateRequestResult ContinuousBatchingPipeline::ContinuousBatchingForEagleDecodi
                                                                         candidate_token_log_probs,
                                                                         logit_processor,
                                                                         false);
+                    //std::cout << "removed tokens: " << result.removed_tokens_cnt << std::endl;
                 }
             }
         }
