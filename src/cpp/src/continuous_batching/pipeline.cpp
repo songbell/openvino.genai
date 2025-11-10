@@ -48,7 +48,11 @@ extract_eagle_mode_from_config(ov::AnyMap& config, const std::filesystem::path& 
             int num_decoder_layers = 0;
             read_json_param(data, "num_hidden_layers", num_decoder_layers);
             OPENVINO_ASSERT(num_decoder_layers > 3, "num_decoder_layers is too small to deduce hidden layers for extraction");
-            // below corresponds to : https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/modeling_llama_kv.py#L1138
+            // The following default hidden layer selection corresponds to the EAGLE reference implementation:
+            // https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/modeling_llama_kv.py#L1138
+            // These layers (2, num_decoder_layers / 2, num_decoder_layers - 3) are chosen to capture features from
+            // early, middle, and late stages of the decoder, as recommended by the EAGLE authors.
+            // If you wish to use different layers, provide the "hidden_layers_list" parameter in the config.
             eagle_rt_info.hidden_layers_list = { 2, num_decoder_layers / 2, num_decoder_layers - 3 };
         }
     }
@@ -351,12 +355,11 @@ std::vector<VLMDecodedResults> ContinuousBatchingPipeline::generate(
 std::vector<VLMDecodedResults> ContinuousBatchingPipeline::generate(
     const std::vector<std::string>& prompts,
     const std::vector<std::vector<ov::Tensor>>& images,
-    const std::vector<std::vector<ov::Tensor>>& video,
+    const std::vector<std::vector<ov::Tensor>>& videos,
     const std::vector<GenerationConfig>& sampling_params,
     const StreamerVariant& streamer) {
-    return m_impl->generate(prompts, images, video, sampling_params, streamer);
+    return m_impl->generate(prompts, images, videos, sampling_params, streamer);
 }
-
 
 void ContinuousBatchingPipeline::start_chat(const std::string& system_message) {
     m_impl->finish_chat();
