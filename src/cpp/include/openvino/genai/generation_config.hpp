@@ -666,7 +666,15 @@ public:
     float assistant_confidence_threshold = 0.f;
     size_t num_assistant_tokens = 0;
     size_t max_ngram_size = 0;
-
+    // eagle parameters for assisting generation
+    struct eagle_params {
+        // eagle/model/cnets.py
+        // total_tokens = self.total_tokens
+        // depth = self.depth
+        // top_k = self.top_k
+        std::vector<size_t> branching_factors; // branching factors for each level of eagle tree
+        size_t tree_depth = 0; // How deep to look ahead, eagle tree depth, draft will run depth + 1(tree init) levels
+    } eagle_tree_params;
     // Structured output parameters
     std::optional<StructuredOutputConfig> structured_output_config;
 
@@ -688,7 +696,7 @@ public:
     bool is_assisting_generation() const;
     bool is_prompt_lookup() const;
     bool is_structured_output_generation() const;
-
+    bool is_eagle_tree() const;
     std::vector<std::shared_ptr<Parser>> parsers;
 
     OPENVINO_DEPRECATED("Please, use `is_assisting_generation()` instead of `is_speculative_decoding()`. This method will be removed in 2026.0.0 release")
@@ -704,6 +712,16 @@ public:
     /// @brief checks that are no conflicting parameters, e.g. do_sample=true and num_beams > 1.
     /// @throws Exception if config is invalid.
     void validate() const;
+    /**
+     * @brief Parse eagle tree parameters from a string.
+     *        Format: "branch1,branch2,...;depth"
+     *        Example: "2,3,4;5" -> branching_factors={2,3,4}, tree_depth=5
+     */
+    void parse_eagle_tree_params(const std::string& tree_str) {
+        // e.g: "[(0,), (1,), (0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]"
+        eagle_tree_params.tree_depth = 4;
+        eagle_tree_params.branching_factors = {2, 3, 1, 1, 1};
+    };
 };
 
 /*

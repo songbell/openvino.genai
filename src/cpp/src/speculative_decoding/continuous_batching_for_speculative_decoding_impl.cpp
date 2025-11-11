@@ -302,6 +302,7 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
                     const auto& shape = pruned_hidden_state.get_shape();
                     validate_length = shape.size() > 0 ? shape[0] : 0;
                 }
+                std::cout << "insert length = " << result.inserted_tokens_cnt <<", remove length = " << result.removed_tokens_cnt << std::endl;
             }
             // we should update a logit processor just for draft model to generate the same tokens
             // logit processors of main model will be updated in sampler while validation mode
@@ -413,5 +414,317 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
     }
     if (eagle_mode_enabled)
         m_model_runner->enable_hidden_state_import(true);
+}
+
+// eagle3 speculative decoding implementation
+UpdateRequestResult ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl::update_main_request(
+    uint64_t request_id,
+    const GeneratedSequences& candidates) {
+    UpdateRequestResult result{0, 0};
+    for (auto& request : m_requests) {
+        if (request_id != request->get_request_id()) {
+            continue;
+        }
+
+        // handle update main request first, at this point, main should already have a logit processor created
+        std::vector<Sequence::Ptr> running_sequences =
+            request->get_running_sequences();  // main model sequences, should be only one sequence
+        OPENVINO_ASSERT(running_sequences.size() > 0);
+        if (running_sequences.front()->get_generated_len() == 0 && !request->get_num_tokens_to_validate()) {
+            m_sampler->create_logit_processor(request_id,
+                                              request->get_sampling_parameters(),
+                                              request->get_prompt_ids());
+            auto& logit_processor = m_sampler->get_logit_processor(request_id);
+            result.inserted_tokens_cnt = 0;
+            // min_generated_tokens = result.inserted_tokens_cnt;
+            // min_candidate_len = result.inserted_tokens_cnt;
+        } else {
+            // for main request, beam search is not supported, so we should have only one sequence in request at this
+            // time always, otherwise, the main request has not finished validation yet, skip it
+            if (running_sequences.size() == 1) {
+                auto first_sequence = running_sequences.front();
+                auto previously_grouped_id = first_sequence->get_grouped_id();
+                size_t generated_len = first_sequence->get_generated_len();
+
+                std::map<size_t, Sequence::Ptr> existing_sequences;
+                for (auto& seq : running_sequences) {
+                    existing_sequences[seq->get_grouped_id()] = seq;
+                }
+
+                std::vector<std::pair<size_t, GeneratedSequence>> sequences_to_fork;
+                std::vector<std::pair<size_t, GeneratedSequence>> sequences_to_update;
+
+                for (const auto& candidate_sequence : candidates) {
+                    size_t candidate_group_id = candidate_sequence.first;
+                    const auto& candidate_data = candidate_sequence.second;
+
+                    if (previously_grouped_id == candidate_group_id) {
+                        sequences_to_update.push_back(candidate_sequence);
+                    } else {
+                        sequences_to_fork.push_back(candidate_sequence);
+                    }
+                }
+                for (const auto& candidate_sequence : sequences_to_fork) {
+                    size_t candidate_group_id = candidate_sequence.first;
+                    const auto& candidate_data = candidate_sequence.second;
+
+                    Sequence::Ptr target_sequence = Sequence::fork(first_sequence, candidate_group_id);
+                    m_scheduler->fork_sequence(first_sequence->get_id(), target_sequence->get_id());
+                    target_sequence->set_status(ov::genai::SequenceStatus::RUNNING);
+                    request->add_sequence(target_sequence);
+
+                    auto token_ids = candidate_data.token_ids;
+                    auto log_probs = candidate_data.log_probs;
+                    size_t min_candidate_len = std::min(token_ids.size(), log_probs.size());
+                    token_ids.resize(min_candidate_len);
+                    log_probs.resize(min_candidate_len);
+
+                    size_t current_generated_len = target_sequence->get_generated_len();
+                    for (size_t i = current_generated_len; i < min_candidate_len; ++i) {
+                        target_sequence->append_token(token_ids[i], log_probs[i]);
+                    }
+                }
+                for (const auto& candidate_sequence : sequences_to_update) {
+                    size_t candidate_group_id = candidate_sequence.first;
+                    const auto& candidate_data = candidate_sequence.second;
+
+                    auto token_ids = candidate_data.token_ids;
+                    auto log_probs = candidate_data.log_probs;
+                    size_t min_candidate_len = std::min(token_ids.size(), log_probs.size());
+                    token_ids.resize(min_candidate_len);
+                    log_probs.resize(min_candidate_len);
+
+                    size_t current_generated_len = first_sequence->get_generated_len();
+                    for (size_t i = current_generated_len; i < min_candidate_len; ++i) {
+                        first_sequence->append_token(token_ids[i], log_probs[i]);
+                    }
+                }
+                auto it = std::find_if(sequences_to_update.begin(),
+                                    sequences_to_update.end(),
+                                    [previously_grouped_id](const std::pair<size_t, GeneratedSequence>& p) {
+                                        return p.first == previously_grouped_id;
+                                    });
+                if (it == sequences_to_update.end()) {
+                    // free as not further needed
+                    first_sequence->set_status(ov::genai::SequenceStatus::FINISHED);
+                    request->remove_sequence(first_sequence->get_id());
+                    m_scheduler->free_sequence(first_sequence->get_id());
+                }
+
+                result.inserted_tokens_cnt = request->get_running_sequences().front()->get_generated_len() -
+                                            generated_len;  // align sequence before validation
+            }
+        }
+        // update request context information to provide correct scheduling phase
+        if (result.inserted_tokens_cnt > 0 && result.removed_tokens_cnt == 0) {
+            request->set_num_validated_tokens(result.inserted_tokens_cnt);
+        }
+        break;
+    }
+    return result;
+}
+
+UpdateRequestResult ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl::update_draft_request(
+    uint64_t request_id,
+    const GeneratedSequences& candidates) {
+    // hidden state
+    // m_model_runner->set_hidden_state(request_id, candidates.begin()->first, hidden_state);
+    UpdateRequestResult result{0, 0};
+    size_t adjust_len = 0;
+    for (auto& request : m_requests) {
+        if (request_id != request->get_request_id()) {
+            continue;
+        }
+
+        std::vector<Sequence::Ptr> running_sequences = request->get_running_sequences();
+        OPENVINO_ASSERT(running_sequences.size() > 0);
+        size_t min_generated_tokens, min_candidate_len;
+        size_t validate_length = 0;
+        bool pause_due_to_main_not_validated = false;
+        if (running_sequences.front()->get_generated_len() == 0 && !request->get_num_tokens_to_validate()) {
+            // for first token append stage
+            OPENVINO_ASSERT(running_sequences.size() == 1,
+                            "draft model should have only one sequence in request at this point.");
+            m_sampler->create_logit_processor(request_id,
+                                              request->get_sampling_parameters(),
+                                              request->get_prompt_ids());
+            // auto& logit_processor = m_sampler->get_logit_processor(request_id);
+            auto candidate = candidates.begin();
+            auto sequence = running_sequences.front();
+            m_model_runner->set_initial_hidden_state(request_id,
+                                                     //sequence->get_grouped_id(),
+                                                     candidate->second.hidden_states);
+
+            auto token_ids = candidate->second.token_ids;
+            auto log_probs = candidate->second.log_probs;
+
+            for (size_t i = 0; i < token_ids.size(); ++i) {
+                sequence->append_token(token_ids[i], log_probs[i]);
+                // logit_processor.register_new_generated_token(token_ids[i]);
+                // logit_processor.update_generated_len(sequence->get_generated_len());
+            }
+            result.inserted_tokens_cnt = token_ids.size();
+            min_generated_tokens = result.inserted_tokens_cnt;
+            min_candidate_len = result.inserted_tokens_cnt;
+        } else {
+            // for generation stage
+            // at this point, we should have one beam selected, now update draft request of same group id
+            // in CB mode, the draft may not been validated yet, skip in this case
+            // TBD: what if eagle tree only produces one candidate branch?
+            auto main_validation_finished = [&] () {
+                if (running_sequences.size() != candidates.size()) {
+                    return true;
+                }
+                for (const auto& running_sequence : running_sequences) {
+                    size_t sequence_group_id = running_sequence->get_grouped_id();                   
+                    auto candidate_it = candidates.find(sequence_group_id);
+
+                    const auto& running_generated_ids = running_sequence->get_generated_ids();
+                    const auto& candidate_token_ids = candidate_it->second.token_ids;
+
+                    if (running_generated_ids.size() != candidate_token_ids.size()) {
+                        return true;
+                    }
+
+                    for (size_t i = 0; i < running_generated_ids.size(); ++i) {
+                        if (running_generated_ids[i] != candidate_token_ids[i]) {
+                            return true;
+                        }
+                    }
+                }
+                pause_due_to_main_not_validated = true;
+                return false;
+            };
+
+            if (main_validation_finished()) { // update draft only after main validation is done
+                auto selected_beam = candidates.begin();
+                auto& logit_processor = m_sampler->get_logit_processor(request_id);
+                std::tie(min_generated_tokens, min_candidate_len) = get_prefix_len(running_sequences, candidates);
+                for (auto& running_sequence : running_sequences) {
+                    if (running_sequence->get_grouped_id() != selected_beam->first) {
+                        running_sequence->set_status(ov::genai::SequenceStatus::FINISHED);
+                        request->remove_sequence(running_sequence->get_id());
+                        // drop the sequence, as it will not be used anymore
+                        m_scheduler->free_sequence(running_sequence->get_id());
+                        continue;
+                    }
+                    const auto generated_token_ids = running_sequence->get_generated_ids();
+                    const auto sequence_generated_len = running_sequence->get_generated_ids().size();
+                    OPENVINO_ASSERT(sequence_generated_len >= min_generated_tokens);
+
+                    result.removed_tokens_cnt = sequence_generated_len - min_generated_tokens;
+                    running_sequence->remove_last_tokens(result.removed_tokens_cnt);
+                    // update hidden_states, remove last removed_tokens_cnt
+                    auto& hidden_state = selected_beam->second.hidden_states;
+                    // update ov::Tensor
+                    ov::Tensor updated_hidden_state =
+                        truncate_hidden_state_from_end(hidden_state, result.removed_tokens_cnt);
+                    adjust_len = request->get_sampling_parameters().eagle_tree_params.tree_depth + 2 - hidden_state.get_shape()[0];
+                    m_model_runner->set_initial_hidden_state(request_id,
+                                                            //running_sequence->get_grouped_id(),
+                                                            updated_hidden_state);
+                    validate_length = updated_hidden_state.get_shape().size() > 0 ? updated_hidden_state.get_shape()[0] : 0;
+                    auto candidate_sequence = candidates.at(running_sequence->get_grouped_id());
+                    std::vector<int64_t> candidate_token_ids = candidate_sequence.token_ids;
+                    std::vector<float> candidate_token_log_probs = candidate_sequence.log_probs;
+                    candidate_token_ids.resize(min_candidate_len);
+                    candidate_token_log_probs.resize(min_candidate_len);
+                    result.inserted_tokens_cnt = insert_tokens_to_sequence(running_sequence,
+                                                                        candidate_token_ids,
+                                                                        candidate_token_log_probs,
+                                                                        logit_processor,
+                                                                        false);
+                }
+            }
+        }
+        if (!pause_due_to_main_not_validated) {
+            // update request context information to provide correct scheduling phase
+            const size_t num_processed_tokens = request->get_num_processed_tokens(), prompt_len = request->get_prompt_len(),
+                        updated_context_len = min_candidate_len + prompt_len,
+                        max_new_tokens = request->get_max_new_tokens();
+            size_t generated_len = request->get_context_len() >= request->get_prompt_len()
+                                    ? request->get_context_len() - request->get_prompt_len() + 1
+                                    : 0;
+            if (generated_len > 0 && validate_length > 0) {
+                // processed token number in draft
+                request->update_processed_tokens_num(num_processed_tokens - (result.removed_tokens_cnt + adjust_len) + 1 -
+                                                    validate_length + 1);
+            }
+            if (validate_length == 0 && result.inserted_tokens_cnt > 0 && result.removed_tokens_cnt == 0) {
+                request->set_num_validated_tokens(result.inserted_tokens_cnt);
+            } else if (validate_length > 0) {
+                request->set_num_validated_tokens(validate_length - 1);  // in generation stage
+            }
+            // to pause `draft_model` generation in case of `generated_len >= max_new_tokens - 1` to generate last token by
+            // `main_model`
+            if (!m_is_validation_mode_enabled) {
+                bool pause_gen_status = false;
+                generated_len -= result.removed_tokens_cnt;
+                generated_len += result.inserted_tokens_cnt;
+                if (generated_len >= max_new_tokens - 1 || result.inserted_tokens_cnt == 0) {
+                    pause_gen_status = true;
+                }
+                request->pause_generation(pause_gen_status);
+            }
+        } else {
+            request->pause_generation(true); // pause draft model generation, and keep draft as it is, as main has not scheduled validation yet
+        }
+        break;
+    }
+
+    return result;
+}
+
+void ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl::multistep() {
+    bool to_generate = true;
+    size_t generated_tokens_cnt = 0;
+    size_t step_count = 0;
+    auto depth = m_requests[0]->get_sampling_parameters().eagle_tree_params.tree_depth;
+    // cycle to generate several tokens per one iteration for speculative decoding case
+    while (to_generate) {
+        generated_tokens_cnt++;
+        step_count++;
+        ManualTimer multistep_timer("speculative_decoding: multistep()");
+        multistep_timer.start();
+        step();
+        multistep_timer.end();
+
+        const auto num_generated_tokens = get_processed_tokens_per_iteration();
+        auto pipeline_metrics = get_metrics();
+        if (num_generated_tokens > 0) {
+            auto generation_duration = multistep_timer.get_duration_microsec();
+            raw_perf_metrics.m_durations.emplace_back(generation_duration);
+            raw_perf_metrics.m_inference_durations[0] = MicroSeconds(pipeline_metrics.inference_duration);
+            raw_perf_metrics.m_batch_sizes.emplace_back(num_generated_tokens);
+        }
+
+        m_model_runner->enable_hidden_state_import(false);
+        to_generate = false;
+        /*if (step_count >= depth + 1) {
+            for (auto& request : m_requests) {
+                auto top_k = m_sampler->get_top_k_selector(request->get_request_id());
+                top_k->finalize_eagle2_candidates();
+            }
+        }*/
+        for (auto& request : m_requests) {
+            const auto& sampling_params = request->get_sampling_parameters();
+            if (0) {  //! sampling_params.is_assisting_generation()) {
+                // generate only one token in case of non speculative decoding
+                // request->pause_generation(true);
+            } else if (request->get_num_processed_tokens() == 0 && sampling_params.num_return_sequences > 1) {
+                request->pause_generation(true);
+            } else if (request->get_max_new_tokens() == 0) {
+                request->pause_generation(true);
+            } else if (request->get_num_processed_tokens() == request->get_prompt_len()) {
+                request->pause_generation(true);
+            }  // else if (is_stop_token_id_hit_in_sequence_group(request, sampling_params.stop_token_ids)) {
+               // request->pause_generation(true);
+            else if (sampling_params.eagle_tree_params.tree_depth > 0 && step_count >= sampling_params.eagle_tree_params.tree_depth + 1) {
+                request->pause_generation(true);
+            }
+            to_generate |= request->can_generate_tokens();
+        }
+    }
+    m_model_runner->enable_hidden_state_import(true);
 }
 }

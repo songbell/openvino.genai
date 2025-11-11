@@ -12,7 +12,7 @@ int main(int argc, char* argv[]) try {
     }
 
     ov::genai::GenerationConfig config;
-    config.max_new_tokens = 100;
+    config.max_new_tokens = 5;
     // Speculative decoding generation parameters like `num_assistant_tokens` and `assistant_confidence_threshold` are mutually excluded.
     // Add parameter to enable speculative decoding to generate `num_assistant_tokens` candidates by draft_model per iteration.
     // NOTE: ContinuousBatching backend uses `num_assistant_tokens` as is. Stateful backend uses `num_assistant_tokens`'s copy as initial
@@ -32,12 +32,13 @@ int main(int argc, char* argv[]) try {
     // Please, set device for main model in `LLMPipeline` constructor and in `ov::genai::draft_model` for draft.
     // CPU, GPU and NPU can be used. For NPU, the preferred configuration is when both the main and draft models
     // use NPU.
-    std::string main_device = "CPU", draft_device = "CPU";
-
+    std::string main_device = "GPU", draft_device = "GPU";
+    ov::AnyMap main_properties = {ov::hint::kv_cache_precision(ov::element::f16)};
+    main_properties.insert(ov::genai::draft_model(draft_model_path, draft_device));
     ov::genai::LLMPipeline pipe(
         main_model_path,
         main_device,
-        ov::genai::draft_model(draft_model_path, draft_device));
+        main_properties);
 
     auto streamer = [](std::string subword) {
         std::cout << subword << std::flush;

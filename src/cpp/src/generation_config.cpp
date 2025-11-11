@@ -245,7 +245,9 @@ size_t GenerationConfig::get_max_new_tokens(size_t prompt_length) const {
         return max_length - prompt_length;
     }
 }
-
+bool GenerationConfig::is_eagle_tree() const {
+    return eagle_tree_params.tree_depth > 0;
+}
 bool GenerationConfig::is_greedy_decoding() const {
     return !do_sample && !is_beam_search();
 }
@@ -348,7 +350,7 @@ void GenerationConfig::validate() const {
     // assistant generation
 
     if (is_assisting_generation()) {
-        OPENVINO_ASSERT(!is_beam_search() && num_return_sequences == 1, "Beam search and parallel sampling are not compatible with assistant generation");
+        //OPENVINO_ASSERT(!is_beam_search() && num_return_sequences == 1, "Beam search and parallel sampling are not compatible with assistant generation");
         OPENVINO_ASSERT(assistant_confidence_threshold == 0.0f || num_assistant_tokens == 0, "Parameters `assistant_confidence_threshold` and `num_assistant_tokens` are mutually exclusive in `GenerationConfig`");
     }
 

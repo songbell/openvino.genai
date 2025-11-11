@@ -20,7 +20,8 @@ enum class SequenceStatus {
     RUNNING = 0,
     FINISHED = 1,
     OUT_OF_MEMORY = 2,
-    WAITING = 3
+    WAITING = 3,
+    CACHING = 4 // Sequence is waiting for top-k to be finialized
 };
 
 enum class SequenceGroupType {
@@ -128,7 +129,9 @@ public:
     void set_status(SequenceStatus status) {
         m_status = status;
     }
-
+    bool is_caching() const {
+        return m_status == SequenceStatus::CACHING;
+    }
     GenerationFinishReason get_finish_reason() const {
         return m_finish_reason;
     }
@@ -570,7 +573,27 @@ public:
 
         return running_seqs;
     }
+    std::vector<Sequence::Ptr> get_caching_sequences() {
+        std::vector<Sequence::Ptr> caching_seqs;
+        for (size_t seq_id = 0; seq_id < m_sequences.size(); ++seq_id) {
+            if (m_sequences[seq_id]->is_caching()) {
+                caching_seqs.emplace_back(m_sequences[seq_id]);
+            }
+        }
 
+        return caching_seqs;
+    }
+
+    std::vector<Sequence::CPtr> get_caching_sequences() const {
+        std::vector<Sequence::CPtr> caching_seqs;
+        for (size_t seq_id = 0; seq_id < m_sequences.size(); ++seq_id) {
+            if (m_sequences[seq_id]->is_caching()) {
+                caching_seqs.emplace_back(m_sequences[seq_id]);
+            }
+        }
+
+        return caching_seqs;
+    }
     uint64_t get_request_id() const {
         return m_request_id;
     }
@@ -734,7 +757,18 @@ public:
     size_t get_num_logical_blocks() const {
         return (get_context_len() - get_num_evicted_tokens() + m_block_size - 1) / m_block_size;
     }
-
+    /**
+     * @return The number of logical KV cache blocks required to host 1 extra token in this sequence group, taking into account previous token evictions.
+     */
+    size_t get_num_logical_blocks_for_1_generation() const {
+        return (get_context_len() - get_num_evicted_tokens() - get_num_tokens_to_validate() + m_block_size - 1) / m_block_size;
+    }
+    /**
+     * @return The number of logical KV cache blocks required to host validation tokens in this sequence group, taking into account previous token evictions.
+     */
+    size_t get_num_logical_blocks_for_validation_tokens() const {
+        return (get_context_len() - get_num_evicted_tokens() - 1 + m_block_size - 1) / m_block_size;
+    }
     // requires number of physical blocks for next generation
     size_t get_num_blocks() const {
         return get_num_logical_blocks();
@@ -781,6 +815,15 @@ public:
 
     GenerationStream::Ptr get_generation_stream() {
         return m_generation_stream;
+    }
+
+    bool is_caching() const {
+        for (size_t seq_id = 0; seq_id < m_sequences.size(); ++seq_id) {
+            if (m_sequences[seq_id]->is_caching()) {
+                return true; // in the middle of drafting stage
+            }
+        }
+        return m_is_gen_paused;
     }
 
     void set_generation_status(GenerationStatus status) {

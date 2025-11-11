@@ -45,6 +45,7 @@ public:
     GenerationHandle add_request(uint64_t request_id,
                                  const std::string& prompt,
                                  const ov::genai::GenerationConfig& sampling_params) override;
+    void step() override;
 protected:
     void update_eagle_pipeline_params(std::shared_ptr<ov::op::v0::Constant>& d2t_tensor);
     ov::Tensor create_draft_input_ids(const ov::Tensor& original_input_ids);

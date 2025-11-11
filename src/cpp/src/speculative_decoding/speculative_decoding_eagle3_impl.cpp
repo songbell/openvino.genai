@@ -333,6 +333,99 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
     update_eagle_pipeline_params(d2t_tensor);
 }
 
+void ContinuousBatchingPipeline::Eagle3DecodingImpl::step() {
+    // this blocks adding new requests during step as it may break coherence between main and draft models
+    auto m_main_eagle_pipeline  = std::dynamic_pointer_cast<ContinuousBatchingForEagle3DecodingImpl>(m_main_pipeline);
+    auto m_draft_eagle_pipeline = std::dynamic_pointer_cast<ContinuousBatchingForEagle3DecodingImpl>(m_draft_pipeline);
+    std::lock_guard<std::mutex> lock{m_draft_generations_mutex};
+    auto& raw_perf_counters = m_perf_metrics.raw_metrics;
+    auto& main_raw_perf_counters = m_perf_metrics.main_model_metrics.raw_metrics;
+
+    ManualTimer step_timer("speculative_decoding: step()");
+    step_timer.start();
+
+    m_draft_pipeline->pull_awaiting_requests(true);
+    m_main_pipeline->pull_awaiting_requests();
+
+    // generate candidates by draft model
+    ManualTimer draft_timer("speculative_decoding: draft_model: multistep()");
+    draft_timer.start();
+    m_draft_pipeline->multistep();
+    draft_timer.end();
+    m_sd_metrics.draft_duration += draft_timer.get_duration();
+    m_pipeline_metrics = m_main_pipeline->get_metrics();
+
+    // to generate num_matches statistic
+    std::map<int64_t, UpdateRequestResult> update_sequence_info;
+    // put candidates to model KV cache
+    auto draft_generated_requests = m_draft_pipeline->get_generated_requests();
+    for (const auto& candidate : m_draft_pipeline->get_generated_requests()) {
+        auto update_result = m_main_eagle_pipeline->update_main_request(candidate.first, candidate.second);
+        update_sequence_info.insert({{candidate.first, update_result}});
+    }
+
+    ManualTimer main_timer("speculative_decoding: main_model: step()");
+    main_timer.start();
+    m_main_pipeline->step();
+    main_timer.end();
+    m_sd_metrics.main_duration += main_timer.get_duration();
+    m_pipeline_metrics = m_main_pipeline->get_metrics();
+    // get logits and last hidden layer
+    auto main_generated_requests =
+        m_main_pipeline->get_generated_requests();  // feature extraction is enabled in main pipeline
+
+    for (const auto& checked_sequence : main_generated_requests) {
+        auto update_result = m_draft_eagle_pipeline->update_draft_request(checked_sequence.first, checked_sequence.second);
+        update_sequence_info[checked_sequence.first].removed_tokens_cnt = update_result.removed_tokens_cnt;
+    }
+
+    // finish draft request if the generation was completed
+    for (const auto& draft_request : draft_generated_requests) {
+        auto request_id = draft_request.first;
+        if (!main_generated_requests.count(request_id)) {
+            m_draft_pipeline->finish_request(request_id);
+            // remove draft_generation_handle from queue
+            m_draft_generations.erase(request_id);
+        }
+        auto updated_seq_info = update_sequence_info[request_id];
+        // several prompt phase
+        if (updated_seq_info.inserted_tokens_cnt == 0) {
+            continue;
+        }
+        float acceptance_rate =
+            1 - static_cast<float>(updated_seq_info.removed_tokens_cnt) / updated_seq_info.inserted_tokens_cnt;
+        m_sd_metrics.update_acceptance_rate(request_id, acceptance_rate * 100);
+        m_sd_metrics.update_draft_accepted_tokens(
+            request_id,
+            (updated_seq_info.inserted_tokens_cnt - updated_seq_info.removed_tokens_cnt));
+    }
+
+    step_timer.end();
+
+    // update perf metrics
+    const auto num_generated_tokens = m_main_pipeline->get_processed_tokens_per_iteration();
+    if (num_generated_tokens > 0) {
+        auto infer_duration = step_timer.get_duration_microsec();
+
+        raw_perf_counters.m_token_infer_durations.emplace_back(infer_duration);
+        raw_perf_counters.m_inference_durations[0] += MicroSeconds(infer_duration);
+        raw_perf_counters.m_new_token_times.emplace_back(main_timer.get_end_time());
+        raw_perf_counters.m_batch_sizes.emplace_back(num_generated_tokens);
+
+        auto main_model_gen_duration = main_timer.get_duration_microsec();
+        auto m_main_pipeline_metrics = m_main_pipeline->get_metrics();
+        main_raw_perf_counters.m_durations.push_back(MicroSeconds(main_model_gen_duration));
+        main_raw_perf_counters.m_inference_durations[0] = MicroSeconds(m_main_pipeline_metrics.inference_duration);
+        main_raw_perf_counters.m_batch_sizes.push_back(num_generated_tokens); // or should be processed + generated
+        m_sd_metrics.update_generated_len(num_generated_tokens);
+    }
+
+    if (main_generated_requests.empty() && utils::env_setup_for_print_debug_info()) {
+        m_sd_metrics.print(true);
+        m_sd_metrics.clean_up();
+    }
+}
+
 ov::Tensor ContinuousBatchingPipeline::Eagle3DecodingImpl::create_draft_input_ids(const ov::Tensor& original_input_ids) {
     auto shape = original_input_ids.get_shape();
     if (shape.size() == 0 || shape.back() <= 1) {
@@ -414,6 +507,7 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::Eagle3DecodingI
             main_cfg.num_assistant_tokens = m_main_pipeline->default_num_assistant_tokens;
             draft_cfg.num_assistant_tokens = main_cfg.num_assistant_tokens;
         }
+        main_cfg.eagle_tree_params.tree_depth = 0; // reset for main
         draft_cfg.ignore_eos = true;
         draft_cfg.stop_strings = {};
         main_in = in_ids;

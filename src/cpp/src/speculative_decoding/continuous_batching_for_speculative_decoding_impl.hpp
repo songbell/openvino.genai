@@ -23,7 +23,7 @@ public:
                                                  const ov::AnyMap& plugin_config,
                                                  bool is_validation_mode_enabled);
 
-    void multistep();
+    virtual void multistep();
 
     void finish_request(int64_t request_id = -1);
     void pull_awaiting_requests(bool is_pause_request = false);
@@ -62,7 +62,14 @@ public:
                                                      };
 
     bool is_requests_empty();
-
+    UpdateRequestResult update_main_request(uint64_t request_id, const GeneratedSequences& candidates);
+    UpdateRequestResult update_draft_request(uint64_t request_id, const GeneratedSequences& candidates);
+    void clear_sampler_top_k_selector(uint64_t request_id) {
+        if (m_sampler) {
+            m_sampler->clear_top_k_selector(request_id);
+        }
+    }
+    void multistep() override;
     void set_d2t_for_draft_decoding(std::shared_ptr<ov::op::v0::Constant>& d2t) {
         if (m_sampler) {
             m_sampler->set_d2t_for_decoding(d2t);
