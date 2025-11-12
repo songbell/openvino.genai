@@ -302,7 +302,6 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
                     const auto& shape = pruned_hidden_state.get_shape();
                     validate_length = shape.size() > 0 ? shape[0] : 0;
                 }
-                std::cout << "insert length = " << result.inserted_tokens_cnt <<", remove length = " << result.removed_tokens_cnt << std::endl;
             }
             // we should update a logit processor just for draft model to generate the same tokens
             // logit processors of main model will be updated in sampler while validation mode
@@ -720,6 +719,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl::multis
             }  // else if (is_stop_token_id_hit_in_sequence_group(request, sampling_params.stop_token_ids)) {
                // request->pause_generation(true);
             else if (sampling_params.eagle_tree_params.tree_depth > 0 && step_count >= sampling_params.eagle_tree_params.tree_depth + 1) {
+                std::cout << "here" << std::endl;
                 request->pause_generation(true);
             }
             to_generate |= request->can_generate_tokens();

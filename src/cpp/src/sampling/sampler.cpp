@@ -1555,11 +1555,11 @@ Sampler::TopKSelector::TopKSelector(SequenceGroup::Ptr sequence_group, ov::Tenso
 }
 
 void Sampler::TopKSelector::tree_reset(SequenceGroup::Ptr& sequence_group) {
-    m_beams.reserve(m_parameters.eagle_tree_params.branching_factors[0]);
+    m_beams.reserve(m_parameters.eagle_tree_params.branching_factor);
     Beam root_beam((*m_sequence_group)[0]);
     root_beam.m_score = 0.0f;
     m_eagle2_candidate_graph = std::make_shared<Eagle2CandidateGraph>(root_beam,
-                                                                        16 - 1,
+                                                                        m_parameters.eagle_tree_params.total_tokens - 1,
                                                                         m_parameters.eagle_tree_params.tree_depth);
     m_beams.push_back(root_beam);
 
@@ -1798,9 +1798,8 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
     }
 
     std::vector<Beam> candidates;
-    std::vector<Beam> child_beams;                                     // beams for next execution in step()
-    size_t branching_factor = m_parameters.eagle_tree_params.branching_factors[m_tree_layer_counter];
-    candidates.reserve(branching_factor * m_beams.size());  // num_beams for each beam
+    std::vector<Beam> child_beams;                                       // beams for next execution in step()
+    candidates.reserve(m_parameters.eagle_tree_params.branching_factor * m_beams.size());  // num_beams for each beam
     m_tree_layer_counter++;
     for (const Beam& beam : m_beams) {
 #if 1 // optimize branch
@@ -1819,7 +1818,7 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
         std::priority_queue<Pair, std::vector<Pair>, decltype(cmp)> minHeap(cmp);
 
         for (size_t i = 0; i < vocab_size; ++i) {
-            if (minHeap.size() < branching_factor) {
+            if (minHeap.size() < m_parameters.eagle_tree_params.branching_factor) {
                 minHeap.emplace(beam_logits[i], i);
             } else if (beam_logits[i] > minHeap.top().first) {
                 minHeap.pop();
@@ -1868,13 +1867,13 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
     // Sample 2 * group_size highest score tokens to get at least 1 non EOS token per beam
     // OPENVINO_ASSERT(candidates.size() >= 2 * group_size, "No beams left to search");
 
-    /*std::partial_sort(candidates.begin(),
-                      candidates.begin() + branching_factor,
+    std::partial_sort(candidates.begin(),
+                      candidates.begin() + m_parameters.eagle_tree_params.branching_factor,
                       candidates.end(),
-                      greater);*/  // select top k of cumulative probs
+                      greater);  // select top k of cumulative probs
     // leave the last cycle of beam selection to candidate finalization stage
-    if (1) {
-        for (size_t cand_idx = 0; cand_idx < candidates.size(); ++cand_idx) {
+    if (m_tree_layer_counter < m_parameters.eagle_tree_params.tree_depth + 1) {
+        for (size_t cand_idx = 0; cand_idx < m_parameters.eagle_tree_params.branching_factor; ++cand_idx) {
             Beam& candidate = candidates[cand_idx];
 
             parent_2_num_childs_map[candidate.m_sequence->get_id()] += 1;
@@ -1913,10 +1912,15 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
 
         // child become parents
         m_beams = child_beams;
-    }
-    if (m_tree_layer_counter > m_parameters.eagle_tree_params.tree_depth) {
-        m_tree_layer_counter = 0;
+    } else { // at this point, we already have the full candidate tree
+        // now we start the finalization of candidates and last cycle of beam selection and sequence forking
+        for (auto& iter : m_sequence_group->get_running_sequences()) { // at this point, we should have running sequence num = branching factor
+            iter->set_status(SequenceStatus::CACHING);
+        }
+        finalize_eagle2_candidates(sampler_output);
+        m_tree_layer_counter = 0;  // reset counter
         m_beams.clear();
+        return;
     }
 }
 

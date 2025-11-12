@@ -47,7 +47,10 @@ int main(int argc, char* argv[]) try {
     ov::genai::GenerationConfig config = ov::genai::greedy();
     config.max_new_tokens = max_new_tokens;
     // Eagle specific parameters
-    config.parse_eagle_tree_params("[(0,), (1,), (0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]");
+    config.eagle_tree_params.branching_factor = 8; // Number of candidate tokens to consider at each level
+    config.eagle_tree_params.tree_depth = depth; // How deep to explore the token tree
+    config.eagle_tree_params.total_tokens = 16; // Total number of tokens to generate in eagle tree
+    config.num_return_sequences = 1; // only support 1
 
     //config.eagle_tree_width = 3;    // Number of candidate tokens to consider at each level
     //config.eagle_tree_depth = 4;    // How deep to explore the token tree
