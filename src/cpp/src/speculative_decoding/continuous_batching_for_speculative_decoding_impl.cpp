@@ -658,7 +658,7 @@ UpdateRequestResult ContinuousBatchingPipeline::ContinuousBatchingForEagle3Decod
             // `main_model`
             if (!m_is_validation_mode_enabled) {
                 bool pause_gen_status = false;
-                generated_len -= result.removed_tokens_cnt;
+                generated_len -= (result.removed_tokens_cnt + adjust_len);
                 generated_len += result.inserted_tokens_cnt;
                 if (generated_len >= max_new_tokens - 1 || result.inserted_tokens_cnt == 0) {
                     pause_gen_status = true;
@@ -719,7 +719,6 @@ void ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl::multis
             }  // else if (is_stop_token_id_hit_in_sequence_group(request, sampling_params.stop_token_ids)) {
                // request->pause_generation(true);
             else if (sampling_params.eagle_tree_params.tree_depth > 0 && step_count >= sampling_params.eagle_tree_params.tree_depth + 1) {
-                std::cout << "here" << std::endl;
                 request->pause_generation(true);
             }
             to_generate |= request->can_generate_tokens();

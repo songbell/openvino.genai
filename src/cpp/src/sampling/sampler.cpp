@@ -1566,7 +1566,7 @@ void Sampler::TopKSelector::tree_reset(SequenceGroup::Ptr& sequence_group) {
 }
 
 void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_output) {
-    size_t max_depth = m_parameters.eagle_tree_params.tree_depth + 1;
+    size_t max_depth = 0;
     auto final_candidates =
         m_eagle2_candidate_graph->get_top_k_candidates();  // currently draft model output wrong candidates
     auto leaf_nodes = m_eagle2_candidate_graph->get_leaf_nodes_from_candidates(final_candidates);
