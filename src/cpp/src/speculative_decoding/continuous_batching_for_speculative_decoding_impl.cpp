@@ -658,7 +658,7 @@ UpdateRequestResult ContinuousBatchingPipeline::ContinuousBatchingForEagle3Decod
             // `main_model`
             if (!m_is_validation_mode_enabled) {
                 bool pause_gen_status = false;
-                generated_len -= result.removed_tokens_cnt;
+                generated_len -= (result.removed_tokens_cnt + adjust_len);
                 generated_len += result.inserted_tokens_cnt;
                 if (generated_len >= max_new_tokens - 1 || result.inserted_tokens_cnt == 0) {
                     pause_gen_status = true;
