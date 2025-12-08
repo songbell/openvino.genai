@@ -225,6 +225,12 @@ public:
 };
 
 class Sampler::TopKSelector {
+    struct static_shape_keeper {
+        size_t depth = 0;
+        size_t num_seq = 0;
+        size_t multiplier = 0;
+    };
+    static static_shape_keeper my_test_params;
     struct Beam {
         Sequence::Ptr m_sequence;
         size_t m_global_beam_idx = 0;

@@ -5,10 +5,10 @@
 
 namespace ov::genai {
 void share_embedding_weights(std::shared_ptr<ov::Model>& main_model, std::shared_ptr<ov::Model>& draft_model) {
-    constexpr size_t MIN_VOCAB_SIZE_THRESHOLD = 1000;
     // extract embedding weight from main model
     auto find_embedding_gather = [](const std::shared_ptr<ov::Model>& model)
         -> std::shared_ptr<ov::Node> {
+        constexpr size_t MIN_VOCAB_SIZE_THRESHOLD = 1000;
         for (const auto& node : model->get_ordered_ops()) {
             auto gather = std::dynamic_pointer_cast<ov::op::util::GatherBase>(node);
             if (!gather) continue;

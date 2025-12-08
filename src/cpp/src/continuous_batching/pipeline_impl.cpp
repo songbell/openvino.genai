@@ -337,8 +337,11 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     {
         static ManualTimer scheduling_timer("scheduling");
         scheduling_timer.start();
+        //const auto infer_start = std::chrono::steady_clock::now();
         scheduler_output = m_scheduler->schedule(m_requests);
+        //const auto infer_end = std::chrono::steady_clock::now();
         scheduling_timer.end();
+        //std::cout << "validation mode: " << m_is_validation_mode_enabled << ", and " << PerfMetrics::get_microsec(infer_end - infer_start) << std::endl;
 
         m_pipeline_metrics.scheduled_requests = scheduler_output.m_scheduled_sequence_groups_ids.size();
         m_pipeline_metrics.cache_usage = scheduler_output.m_cache_usage;

@@ -719,7 +719,6 @@ void ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl::multis
             }  // else if (is_stop_token_id_hit_in_sequence_group(request, sampling_params.stop_token_ids)) {
                // request->pause_generation(true);
             else if (sampling_params.eagle_tree_params.tree_depth > 0 && step_count >= sampling_params.eagle_tree_params.tree_depth + 1) {
-                std::cout << "here" << std::endl;
                 request->pause_generation(true);
             }
             to_generate |= request->can_generate_tokens();

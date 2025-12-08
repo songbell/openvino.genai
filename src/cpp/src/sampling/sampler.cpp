@@ -183,7 +183,7 @@ int match_stop_string2(Tokenizer & tokenizer, const TokenIds & generated_tokens,
     return 0;
 }
 
-void pad_sequence_lengths(SequenceGroup::Ptr& sequence_group) {
+void pad_sequence_lengths(SequenceGroup::Ptr& sequence_group, int extra_padding_to) {
     auto running_sequences = sequence_group->get_running_sequences();
     if (running_sequences.empty()) {
         return;
@@ -193,10 +193,27 @@ void pad_sequence_lengths(SequenceGroup::Ptr& sequence_group) {
     for (const auto& seq : running_sequences) {
         max_length = std::max(max_length, seq->get_generated_ids().size());
     }
+    int extra_padding = 0;
+    if (extra_padding_to > 0)
+        extra_padding = extra_padding_to - (sequence_group->get_prompt_len() + static_cast<int>(max_length));
 
     for (auto& seq : running_sequences) {
         while (seq->get_generated_ids().size() < max_length) {
             seq->append_token(-1, 0.0f);
+        }
+    }
+    if (extra_padding > 0) {
+        for (auto& seq : running_sequences) {
+            for (int i = 0; i < extra_padding; ++i) {
+                seq->append_token(-1, 0.0f);
+            }
+        }
+        extra_padding = 0;
+    }
+    if (extra_padding < 0) {
+        // remove extra padding
+        for (auto& seq : running_sequences) {
+            seq->remove_last_tokens(-extra_padding);
         }
     }
 }
@@ -1564,9 +1581,10 @@ void Sampler::TopKSelector::tree_reset(SequenceGroup::Ptr& sequence_group) {
     m_beams.push_back(root_beam);
 
 }
+ov::genai::Sampler::TopKSelector::static_shape_keeper ov::genai::Sampler::TopKSelector::my_test_params;
 
 void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_output) {
-    size_t max_depth = m_parameters.eagle_tree_params.tree_depth + 1;
+    size_t max_depth = 0;
     auto final_candidates =
         m_eagle2_candidate_graph->get_top_k_candidates();  // currently draft model output wrong candidates
     auto leaf_nodes = m_eagle2_candidate_graph->get_leaf_nodes_from_candidates(final_candidates);
@@ -1574,8 +1592,8 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
     retrieve_indices.reserve(leaf_nodes.size());
     std::vector<Beam> child_beams;
     std::map<uint64_t, uint64_t> parent_2_num_childs_map;
-    // check the maxium depth of all leaf nodes
-    for (auto& leaf : leaf_nodes) {
+    int extra_padding_to = 0;
+    /*for (auto& leaf : leaf_nodes) {
         if (leaf.m_tree_layer > max_depth) {
             max_depth = leaf.m_tree_layer;
         }
@@ -1583,7 +1601,30 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
     auto max_concurrent_seq = 16 / (max_depth + 1); // for target model, 48 batches in maximum
     if (max_concurrent_seq < leaf_nodes.size()) {
         leaf_nodes.erase(leaf_nodes.begin() + max_concurrent_seq, leaf_nodes.end());
+    }*/
+    // check the maxium depth of all leaf nodes
+    for (auto& leaf : leaf_nodes) {
+        if (leaf.m_tree_layer > max_depth) {
+            max_depth = leaf.m_tree_layer;
+        }
     }
+    auto max_concurrent_seq = 16 / (max_depth + 1); // for target model, 48 batches in maximum
+    if (ov::genai::Sampler::TopKSelector::my_test_params.depth == 0) {
+        ov::genai::Sampler::TopKSelector::my_test_params.depth = max_depth;
+        ov::genai::Sampler::TopKSelector::my_test_params.num_seq = max_concurrent_seq;
+        ov::genai::Sampler::TopKSelector::my_test_params.multiplier = max_concurrent_seq * (max_depth + 1);
+
+    }
+
+    if (max_depth != ov::genai::Sampler::TopKSelector::my_test_params.depth) {
+        max_depth = ov::genai::Sampler::TopKSelector::my_test_params.depth;
+        max_concurrent_seq = ov::genai::Sampler::TopKSelector::my_test_params.num_seq;
+    }
+    extra_padding_to = m_sequence_group->get_num_processed_tokens() + 2 - (m_parameters.eagle_tree_params.tree_depth + 1) + max_depth;
+    if (max_concurrent_seq < leaf_nodes.size()) {
+        leaf_nodes.erase(leaf_nodes.begin() + max_concurrent_seq, leaf_nodes.end());
+    }
+    //std::cout << "sent " << max_concurrent_seq << " sequences for target model validation." << std::endl;
     // process all leaf nodes
     for (const Beam& leaf : leaf_nodes) {
         if (leaf.m_tree_layer == m_parameters.eagle_tree_params.tree_depth + 1) {
@@ -1755,8 +1796,7 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
             std::cout << "No matching sequence found for a path of length " << path.size() << std::endl;
         }
     }
-
-    pad_sequence_lengths(m_sequence_group);
+    pad_sequence_lengths(m_sequence_group, extra_padding_to);
     // drop all waiting sequences
     auto seqs = m_sequence_group->get_sequences();
     for (auto& seq : seqs) {

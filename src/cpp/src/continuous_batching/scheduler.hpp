@@ -525,7 +525,7 @@ private:
         for (auto idx = 0; idx < sequence_groups.size(); idx++) {
             auto seq_length = sequence_groups[idx]->get_prompt_len() * m_kv_blocks_initial_multiplier;
             const auto& gen_config = sequence_groups[idx]->get_sampling_parameters();
-            seq_length = std::min(seq_length, sequence_groups[idx]->get_prompt_len() + sequence_groups[idx]->get_max_new_tokens());
+            seq_length = std::min(seq_length, sequence_groups[idx]->get_prompt_len() + (sequence_groups[idx]->get_max_new_tokens() * 10));
             size_t blocks_num = std::ceil(static_cast<float>(seq_length) / m_block_manager->get_block_size());
             if (gen_config.is_beam_search()) {
                 blocks_num *= gen_config.num_beams;
