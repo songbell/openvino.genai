@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "openvino/genai/text_streamer.hpp"
+#include "openvino/pass/sdpa_to_paged_attention.hpp"
 #include "speculative_decoding_impl.hpp"
 #include "continuous_batching/paged_attention_transformations.hpp"
 #include "utils.hpp"
@@ -27,14 +28,28 @@ bool are_tokenizers_equal(Tokenizer& lhs, Tokenizer& rhs) {
 
 std::pair<ov::genai::SchedulerConfig, ov::genai::SchedulerConfig>
 ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(const ov::genai::ModelDesc& main_model_desc, const ov::genai::ModelDesc& draft_model_desc) {
-    OPENVINO_ASSERT(main_model_desc.model != nullptr, "Main model cannot be null");
-    OPENVINO_ASSERT(draft_model_desc.model != nullptr, "Draft model cannot be null");
-    utils::apply_paged_attention_transformations(main_model_desc.model, main_model_desc.scheduler_config.use_cache_eviction);
-    utils::apply_paged_attention_transformations(draft_model_desc.model, main_model_desc.scheduler_config.use_cache_eviction);
+    auto main_model = main_model_desc.model,
+         draft_model = draft_model_desc.model;
+    OPENVINO_ASSERT(main_model != nullptr, "Main model cannot be null");
+    OPENVINO_ASSERT(draft_model != nullptr, "Draft model cannot be null");
 
-    utils::apply_gather_before_matmul_transformation(main_model_desc.model);
-    utils::apply_gather_before_matmul_transformation(draft_model_desc.model);
+    auto main_device = main_model_desc.device;
+    bool allow_score_aggregation = true;
+    bool allow_xattention = false;
 
+    ov::pass::SDPAToPagedAttention(main_model_desc.scheduler_config.use_cache_eviction,
+                                   main_model_desc.scheduler_config.use_cache_eviction,
+                                   allow_score_aggregation,
+                                   allow_xattention).run_on_model(main_model);
+    ov::pass::SDPAToPagedAttention(main_model_desc.scheduler_config.use_cache_eviction,
+                                   main_model_desc.scheduler_config.use_cache_eviction,
+                                   allow_score_aggregation,
+                                   allow_xattention).run_on_model(draft_model);
+
+    utils::apply_gather_before_matmul_transformation(main_model);
+    utils::apply_gather_before_matmul_transformation(draft_model);
+
+    std::string draft_device = draft_model_desc.device.empty() ? main_model_desc.device : draft_model_desc.device;
     bool is_draft_scheduler_undefined = draft_model_desc.scheduler_config == SchedulerConfig();
 
     auto main_scheduler_config = main_model_desc.scheduler_config;
