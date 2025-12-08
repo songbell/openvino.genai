@@ -1059,7 +1059,9 @@ public:
         std::lock_guard<std::mutex> lock(m_cached_blocks_map_mutex);
         // Will always allocate the identical number of new blocks (if any) to each of the "layers" to keep the
         // number of blocks occupied by each "layer" identical at all times.
-        size_t num_logical_blocks = seq_group->get_num_tokens_to_validate() > 0 ? seq_group->get_num_logical_blocks_for_1_generation() :seq_group->get_num_logical_blocks();
+        bool is_validation_stage = seq_group->get_num_tokens_to_validate() > 0 && seq_group->can_generate_tokens();
+        size_t num_logical_blocks = is_validation_stage ? seq_group->get_num_logical_blocks_for_1_generation() : seq_group->get_num_logical_blocks();
+        
         std::vector<Sequence::Ptr> running_sequences = seq_group->get_running_sequences();
 
         std::map<size_t, std::list<size_t>> copy_blocks_map;
