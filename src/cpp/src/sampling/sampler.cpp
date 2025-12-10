@@ -1628,6 +1628,10 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
     for (const Beam& leaf : leaf_nodes) {
         // Get the path from root to this leaf
         std::vector<int64_t> path = m_eagle2_candidate_graph->get_path_to_node(leaf.m_node_id);
+        // trim length of path to max_depth from the end
+        if (path.size() > max_depth) {
+            path.erase(path.begin() + max_depth, path.end());
+        }
         retrieve_indices.push_back(path);
     }
     auto find_len_common_prefix = [] (const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
