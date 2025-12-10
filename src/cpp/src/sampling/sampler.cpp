@@ -1595,7 +1595,6 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
     retrieve_indices.reserve(leaf_nodes.size());
     std::vector<Beam> child_beams;
     std::map<uint64_t, uint64_t> parent_2_num_childs_map;
-    int extra_padding_to = 0;
     /*for (auto& leaf : leaf_nodes) {
         if (leaf.m_tree_layer > max_depth) {
             max_depth = leaf.m_tree_layer;
@@ -1623,183 +1622,93 @@ void Sampler::TopKSelector::finalize_eagle2_candidates(SamplerOutput& sampler_ou
         max_depth = ov::genai::Sampler::TopKSelector::my_test_params.depth;
         max_concurrent_seq = ov::genai::Sampler::TopKSelector::my_test_params.num_seq;
     }
-    extra_padding_to = m_sequence_group->get_num_processed_tokens() + 2 - (m_parameters.eagle_tree_params.tree_depth + 1) + max_depth;
     if (max_concurrent_seq < leaf_nodes.size()) {
         leaf_nodes.erase(leaf_nodes.begin() + max_concurrent_seq, leaf_nodes.end());
     }
-    //std::cout << "sent " << max_concurrent_seq << " sequences for target model validation." << std::endl;
-    // process all leaf nodes
     for (const Beam& leaf : leaf_nodes) {
-        if (leaf.m_tree_layer == m_parameters.eagle_tree_params.tree_depth + 1) {
-            parent_2_num_childs_map[leaf.m_sequence->get_id()] += 1;
-            child_beams.push_back(leaf);  // update fork info when needed, at this point, the first and last layer are ready
-        } else {
-            // Get the path from root to this leaf
-            std::vector<int64_t> path = m_eagle2_candidate_graph->get_path_to_node(leaf.m_node_id);
-            retrieve_indices.push_back(path);
-        }
+        // Get the path from root to this leaf
+        std::vector<int64_t> path = m_eagle2_candidate_graph->get_path_to_node(leaf.m_node_id);
+        retrieve_indices.push_back(path);
     }
-    for (Beam& child_beam : child_beams) {
-        uint64_t parent_sequence_id = child_beam.m_sequence->get_id();
-        uint64_t& num_childs = parent_2_num_childs_map[parent_sequence_id];
-
-        // if current beam is forked multiple times
-        if (num_childs > 1) {
-            child_beam.m_sequence = m_sequence_group->fork_sequence(child_beam.m_sequence);
-            child_beam.m_sequence->set_status(SequenceStatus::RUNNING);
-            child_beam.m_sequence->append_token(child_beam.m_token_id, child_beam.m_log_prob);
-
-            // reduce forks count, since fork already happened and next loop iteration
-            // will go by the second branch (num_childs == 1)
-            --num_childs;
-
-            // fill out sampler output
-            sampler_output.m_forked_sequences[parent_sequence_id].push_back(child_beam.m_sequence->get_id());
-        } else if (num_childs == 1) {
-            // keep current sequence going and add a new token
-            child_beam.m_sequence->set_status(SequenceStatus::RUNNING);
-            child_beam.m_sequence->append_token(child_beam.m_token_id, child_beam.m_log_prob);
-        }
-    }
-
-    // now we have all leaf nodes and their paths, we can update sequences
-    // search for existing sequences in sequence group
-    auto all_sequences = m_sequence_group->get_caching_sequences();
-    std::vector<Sequence::Ptr> available_sequences = all_sequences;
-    std::vector<Sequence::Ptr> used_sequences;
-
-    std::set<uint64_t> used_sequence_ids;
-    std::vector<std::vector<int64_t>> remaining_retrieve_indices;
-    auto max_num_generated_token = m_sequence_group->get_num_processed_tokens() - m_sequence_group->get_prompt_len() + 1;
-    for (size_t i = 0; i < retrieve_indices.size(); ++i) {
-        const std::vector<int64_t>& path = retrieve_indices[i];
-        bool found_exact_match = false;
-
-        for (auto it = available_sequences.begin(); it != available_sequences.end(); ++it) {
-            Sequence::Ptr seq = *it;
-
-            if (used_sequence_ids.count(seq->get_id())) {
-                continue;
-            }
-            const auto& generated_ids = seq->get_generated_ids();
-            if (generated_ids.size() < path.size()) {
-                continue;  // cannot match if generated ids are shorter than path
-            }
-            auto adjust_len = max_num_generated_token - seq->get_generated_len();
-            int start_idx = generated_ids.size() - (m_parameters.eagle_tree_params.tree_depth) + adjust_len;
-            if (start_idx < 0) {
-                start_idx = 0; // ensure we do not go out of bounds
-            }
-            auto iter = std::search(generated_ids.begin() + start_idx, generated_ids.end(), path.begin(), path.end());
-            if (iter != generated_ids.end()) {
-                size_t tokens_to_remove = std::distance(iter, generated_ids.end()) - path.size();
-                seq->remove_last_tokens(tokens_to_remove);
-                seq->set_status(SequenceStatus::RUNNING);
-                used_sequences.push_back(seq);
-                used_sequence_ids.insert(seq->get_id());
-
-                available_sequences.erase(it);
-                found_exact_match = true;
+    auto find_len_common_prefix = [] (const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
+        size_t min_length = std::min(a.size(), b.size());
+        size_t common_length = 0;
+        for (size_t i = 0; i < min_length; ++i) {
+            if (a[i] == b[i]) {
+                common_length++;
+            } else {
                 break;
             }
         }
-
-        if (!found_exact_match) {
-            remaining_retrieve_indices.push_back(path);
+        return common_length;
+    };
+    auto find_candidate_sequence = [&] (SequenceGroup::Ptr sequence_group,
+                                           const std::vector<int64_t>& target_path,
+                                           size_t tree_depth,
+                                           size_t past_generate_len) -> Sequence::Ptr {
+        std::pair<size_t, size_t> max_length_seq = {0, 0};
+        for (auto& seq : sequence_group->get_caching_sequences()) {
+            auto generated_ids = seq->get_generated_ids();
+            std::vector<int64_t> generated_ids_sub(generated_ids.begin() + past_generate_len, generated_ids.end());
+            if (find_len_common_prefix(generated_ids_sub, target_path) > max_length_seq.first) {
+                max_length_seq.first = find_len_common_prefix(generated_ids_sub, target_path);
+                max_length_seq.second = seq->get_id();
+                if (max_length_seq.first == tree_depth) {
+                    return seq;
+                }
+            }
+        }
+        // return the sequence with maximum common prefix
+        for (auto& seq : sequence_group->get_caching_sequences()) {
+            if (seq->get_id() == max_length_seq.second) {
+                return seq;
+            }
+        }
+        return nullptr;
+    }; 
+    for (auto& indice : retrieve_indices) {
+        // locate the candidate sequence
+        // rewind to the start position of the generated tokens
+        // find the sequence with maximum common prefix
+        auto sequence = find_candidate_sequence(m_sequence_group, indice, m_parameters.eagle_tree_params.tree_depth, m_past_generate_len);
+        parent_2_num_childs_map[sequence->get_id()] += 1;
+        // update tokens to candidate sequnce
+    }
+    for (auto& iter : m_sequence_group->get_caching_sequences()) {
+        // fork sequence if child > 1
+        auto it = parent_2_num_childs_map.find(iter->get_id());
+        if (it != parent_2_num_childs_map.end()) {
+            if (it->second > 1) {
+                // fork needed
+                for (size_t i = 0; i < it->second - 1; ++i) {
+                    auto forked_seq = m_sequence_group->fork_sequence(iter);
+                    forked_seq->set_status(SequenceStatus::CACHING);
+                    sampler_output.m_forked_sequences[iter->get_id()].push_back(forked_seq->get_id());
+                }
+            }
         }
     }
+    // update the tokens from retrieve_indices to corresponding sequences
+    for (size_t i = 0; i < retrieve_indices.size(); ++i) {
+        const auto& path = retrieve_indices[i];
+        // locate the candidate sequence
+        auto sequence = find_candidate_sequence(m_sequence_group, path, m_parameters.eagle_tree_params.tree_depth, m_past_generate_len);
+        // remove last tokens if needed
+        size_t current_generated_len = sequence->get_generated_len();
+        size_t tokens_to_remove = current_generated_len - m_past_generate_len;
+        sequence->remove_last_tokens(tokens_to_remove);
 
-    std::map<uint64_t, uint64_t> child_2_parent_map;;
-    for (int i = 0; i < remaining_retrieve_indices.size(); ++i) {
-        const auto& path = remaining_retrieve_indices[i];
-        // find best matching sequence in the remaining caching sequences
-        Sequence::Ptr best_match = nullptr;
-        size_t max_common_length = 0;
-        size_t best_match_start_pos = 0;
-        for (auto& seq : available_sequences) {
-            const auto& generated_ids = seq->get_generated_ids();
-            if (generated_ids.empty()) {
-                continue;
-            }
-            auto adjust_len = max_num_generated_token - seq->get_generated_len();
-            int start_idx = generated_ids.size() - (m_parameters.eagle_tree_params.tree_depth) + adjust_len;
-            if (start_idx < 0) {
-                start_idx = 0; // ensure we do not go out of bounds
-            }
-            for (size_t start_pos = start_idx; start_pos <= generated_ids.size() - 1; ++start_pos) {
-                size_t common_length = 0;
-
-                for (size_t i = 0; i < path.size() && (start_pos + i) < generated_ids.size(); ++i) {
-                    if (path[i] == generated_ids[start_pos + i]) {
-                        common_length++;
-                    } else {
-                        break; // Break on first mismatch (we want contiguous matches)
-                    }
-                }
-
-                // If this is the best match so far, update our tracking variables
-                if (common_length > max_common_length) {
-                    max_common_length = common_length;
-                    best_match = seq;
-                    best_match_start_pos = start_pos;
-                }
-            }
+        // append new tokens
+        for (size_t t = 0; t < path.size(); ++t) {
+            sequence->append_token(path[t], 0.0f);
         }
-        auto need_to_fork = [&] () {
-            // check the remaining_retrive_indices from i+1 to find if same common prefix exists
-            for (size_t j = i + 1; j < remaining_retrieve_indices.size(); ++j) {
-                const auto& next_path = remaining_retrieve_indices[j];
-                if (next_path.size() > max_common_length &&
-                    std::equal(path.begin(), path.begin() + max_common_length, next_path.begin())) {
-                    return true;
-                }
-            }
-            return false;
-        };
-        if (best_match && max_common_length > 0) {
-            if (need_to_fork()) {
-                // Fork the sequence if needed
-                // loop the child_2_parent_map to find the very parent
-                auto forked_sequence = m_sequence_group->fork_sequence(best_match);
-                available_sequences.push_back(forked_sequence);
-                auto parent_id = best_match->get_id();
-                child_2_parent_map[forked_sequence->get_id()] = parent_id;
-                while (child_2_parent_map.find(parent_id) != child_2_parent_map.end()) {
-                    parent_id = child_2_parent_map[parent_id];
-                }
-                sampler_output.m_forked_sequences[parent_id].push_back(forked_sequence->get_id());
-            }
-            // Mark the sequence as running and used
-            best_match->set_status(SequenceStatus::RUNNING);
-            used_sequences.push_back(best_match);
-            used_sequence_ids.insert(best_match->get_id());    
-            // Remove this sequence from available sequences
-            available_sequences.erase(std::remove(available_sequences.begin(), 
-                                                available_sequences.end(), 
-                                                best_match), 
-                                    available_sequences.end());
-
-
-            // For now, let's just ensure the token sequence matches the path
-            // by removing any extra tokens and adding missing ones
-            size_t current_length = best_match->get_generated_ids().size();
-
-            // Remove tokens if needed (if sequence is longer than path)
-            if (current_length - best_match_start_pos > path.size()) {
-                size_t tokens_to_remove = current_length - path.size();
-                best_match->remove_last_tokens(tokens_to_remove);
-            }
-
-            // append tokens to match the path
-            for (size_t i = 0; i < path.size() - max_common_length; ++i) {
-                // Append missing tokens
-                best_match->append_token(path[i + max_common_length], 0.0f);  // Using 0.0f as default log_prob, as I do not care the prob later
-            }
-        } else {
-            std::cout << "No matching sequence found for a path of length " << path.size() << std::endl;
+        // padding path to max_length
+        for (size_t pad = path.size(); pad < max_depth; ++pad) {
+            sequence->append_token(-1, 0.0f); // pad with 0 token
         }
+        sequence->set_status(SequenceStatus::RUNNING);
     }
-    pad_sequence_lengths(m_sequence_group, extra_padding_to);
+
     // drop all waiting sequences
     auto seqs = m_sequence_group->get_sequences();
     for (auto& seq : seqs) {
@@ -1819,6 +1728,7 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
 
     if (m_tree_layer_counter == 0 && m_beams.empty()) {
         tree_reset(m_sequence_group);
+        OPENVINO_ASSERT(m_sequence_group->num_running_seqs() == 1);
     }
 
     for (Beam& beam : m_beams) {
@@ -1843,6 +1753,8 @@ void Sampler::TopKSelector::select_top_k(const ov::Tensor& logits, SamplerOutput
     std::vector<Beam> candidates;
     std::vector<Beam> child_beams;                                       // beams for next execution in step()
     candidates.reserve(m_parameters.eagle_tree_params.branching_factor * m_beams.size());  // num_beams for each beam
+    if (m_tree_layer_counter == 0)
+        m_past_generate_len = m_sequence_group->get_running_sequences()[0]->get_generated_len();
     m_tree_layer_counter++;
     for (const Beam& beam : m_beams) {
 #if 1 // optimize branch
