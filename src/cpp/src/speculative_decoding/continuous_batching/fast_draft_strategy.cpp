@@ -196,7 +196,9 @@ void ContinuousBatchingPipeline::SpeculativeDecodingImpl::step() {
         auto update_result = m_main_pipeline->update_request(candidate.first, candidate.second, false);
         update_sequence_info.insert({{candidate.first, update_result}});
     }
-
+    if (m_kv_update_future.valid()) {
+        m_kv_update_future.wait();
+    }
     const auto main_start = std::chrono::steady_clock::now();
     m_main_pipeline->step();
     const auto main_end = std::chrono::steady_clock::now();

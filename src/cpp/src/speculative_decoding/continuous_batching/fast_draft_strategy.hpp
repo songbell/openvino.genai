@@ -197,6 +197,7 @@ public:
     const Tokenizer& tokenizer() const { return m_tokenizer; }
 
     std::mutex& draft_generations_mutex() { return m_draft_generations_mutex; }
+    std::future<void> m_kv_update_future;
 };
 
 }  // namespace ov::genai

@@ -253,6 +253,125 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::init_r
     return {0, 0};
 }
 
+void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::collect_block_update_info(
+    const GeneratedRequests& main_generated_requests,
+    std::vector<int32_t>& block_update_indices,
+    std::vector<int32_t>& block_update_begins) const {
+    block_update_indices.clear();
+    block_update_begins.clear();
+    block_update_begins.resize(main_generated_requests.size() + 1, 0);
+
+    std::map<size_t, std::map<size_t, size_t>> remap_indices;
+    size_t total_indices_to_remap = 0;
+    for (auto& request_entry : main_generated_requests) {
+        const auto request_id = request_entry.first;
+        const auto& sequences = request_entry.second;
+        size_t i = 0;
+
+        auto seq_group_it = std::find_if(m_requests.begin(), m_requests.end(),
+                                         [request_id](const SequenceGroup::Ptr& sg) { return sg->get_request_id() == request_id; });
+        if (seq_group_it == m_requests.end()) {
+            block_update_begins[i + 1] = static_cast<int32_t>(total_indices_to_remap);
+            continue;
+        }
+
+        OPENVINO_ASSERT(sequences.size() == 1);
+        for (const auto& seq_entry : sequences) {
+            const auto& validated_indices = seq_entry.second.eagle_metadata.validated_indices;
+            if (validated_indices.empty()) {
+                continue;
+            }
+
+            const size_t prev_num_processed_tokens =
+                (*seq_group_it)->get_num_processed_tokens() - validated_indices.size();
+            size_t index = prev_num_processed_tokens;
+
+            for (const auto& idx : validated_indices) {
+                const size_t src_idx = prev_num_processed_tokens + idx;
+                if (src_idx == index) {
+                    ++index;
+                    continue;
+                }
+
+                remap_indices[i].emplace(src_idx, index);  // src idx, dst idx
+                ++index;
+            }
+
+            const auto remap_it = remap_indices.find(i);
+            if (remap_it != remap_indices.end() && !remap_it->second.empty()) {
+                total_indices_to_remap += remap_it->second.size();
+            }
+            block_update_begins[i + 1] = static_cast<int32_t>(total_indices_to_remap);
+            i++;
+        }
+    }
+
+    if (!remap_indices.empty()) {
+        block_update_indices.resize(2 * total_indices_to_remap);  // each remap index has src and dst idx
+        size_t filled_count = 0;
+        for (const auto& [_, indices_map] : remap_indices) {
+            for (const auto& [src_idx, dst_idx] : indices_map) {
+                const size_t tensor_offset = 2 * filled_count;
+                block_update_indices[tensor_offset] = static_cast<int32_t>(src_idx);
+                block_update_indices[tensor_offset + 1] = static_cast<int32_t>(dst_idx);
+                ++filled_count;
+            }
+        }
+    }
+}
+
+/*void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update_kv_update_info(GeneratedRequests& generated_request) {
+    std::vector<int32_t> block_update_begins, block_update_indices;
+    block_update_begins.push_back(0);
+    size_t total_indices_to_remap = 0;
+    std::map<size_t, std::map<size_t, size_t>> remap_indices;
+    for (const auto& request : generated_request)
+    for (auto& request : m_requests) {
+        if (request->get_request_id() != request_id) {
+            continue;
+        }
+        std::vector<Sequence::Ptr> running_sequences = request->get_running_sequences();
+        OPENVINO_ASSERT(running_sequences.size() == 1);
+        auto running_sequence = running_sequences[0];
+        if (!candidates.count(running_sequence->get_grouped_id())) {
+            continue;
+        }
+        auto candidate_sequence = candidates.at(running_sequence->get_grouped_id());
+        auto validated_indices = candidate_sequence.validate_indices;
+        if (validated_indices.empty()) {
+            continue;
+        }
+        auto num_processed_tokens = request->get_num_processed_tokens(request_id);
+        size_t prev_num_processed_tokens = num_processed_tokens - validated_indices.size();
+        size_t index = prev_num_processed_tokens;
+        for (auto& idx : validated_indices) {
+            if (prev_num_processed_tokens + idx == index) {
+                // skip indexes which map to themselves
+                index++;
+                continue;
+            }
+            remap_indices[i].emplace(prev_num_processed_tokens + idx, index);  // src idx, dst idx
+            index++;
+        }
+        auto it = remap_indices.find(i);
+        if (it != remap_indices.end() && !it->second.empty()) {
+            total_indices_to_remap += remap_indices[i].size();
+        }
+        block_update_begins.push_back(total_indices_to_remap);
+    }
+    if (remap_indices.size() > 0) {
+        uint32_t m_kv_remap_indices_filled_count = 0;
+        for (auto & [seq_group_id, indices_map] : remap_indices) {
+            auto running_sequences = sequence_groups[seq_group_id]->get_running_sequences();
+            for (const auto& [src_idx, dst_idx] : indices_map) {
+                size_t tensor_offset = 2 * (m_kv_remap_indices_filled_count++);
+                block_update_indices[tensor_offset]     = static_cast<int32_t>(src_idx);
+                block_update_indices[tensor_offset + 1] = static_cast<int32_t>(dst_idx);
+            }
+        }
+    }
+}*/
+
 UpdateRequestResult
 ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update_request(uint64_t request_id,
                                                                                          const GeneratedSequences& candidates,

@@ -6,6 +6,27 @@
 #include "logger.hpp"
 
 namespace ov::genai {
+KVUpdateWrapper::KVUpdateWrapper(const ov::genai::ModelDesc& kv_model_desc, const size_t& kv_num) {
+    m_kv_layers_num = kv_num;
+    m_request =
+            utils::singleton_core().compile_model(kv_model_desc.model, kv_model_desc.device, kv_model_desc.properties).create_infer_request();
+}
+
+void KVUpdateWrapper::update_request(uint64_t request_id, const GeneratedSequences& candidates) {
+    for (const auto& [sequence_id, generated_sequence] : candidates) {
+        const auto& hidden_states = generated_sequence.hidden_states;
+        OPENVINO_ASSERT(hidden_states.get_element_type() == ov::element::f32, "Only fp32 hidden states are supported in KV update");
+        // set input tensors and run inference for kv update model
+        // currently we run kv update for each generated token, so batch size is 1. In future, if we want to run kv update for multiple tokens together, we need to stack hidden states and adjust input tensors accordingly.
+        m_request.set_tensor("hidden_states", hidden_states);
+        m_request.infer();
+        // get updated kv cache from output tensors and store them in some data structure for later use during main model inference
+        // the way to store updated kv cache depends on how main model inference is implemented. For example, if main model inference is implemented in a way that it can take updated kv cache as input tensors, then we can directly store updated kv cache in a map with sequence_id as key and updated kv cache as value. If main model inference is implemented in a way that it needs to access updated kv cache through some interface, then we can implement that interface to return updated kv cache based on sequence_id.
+        auto updated_key_cache = m_request.get_tensor("updated_key_cache");
+        auto updated_value_cache = m_request.get_tensor("updated_value_cache");
+        // store or use updated_key_cache and updated_value_cache as needed
+    }
+}
 ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::genai::ModelDesc& main_model_desc,
                                                                  const ov::genai::ModelDesc& draft_model_desc,
                                                                  const std::vector<int32_t>& hidden_layers) {
@@ -32,7 +53,8 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
     // move the FC layer from draft model to main model
     utils::eagle3::move_fc_from_draft_to_main(draft_model, main_model);
     utils::eagle3::transform_hidden_state(draft_model, {-1});
-
+    // modeling kv cache update from main model
+    auto kv_model = utils::eagle3::construct_eagle3_kv_update_model(main_model);
     // to create `main_pipeline` with enabled validation_mode and `draft_pipeline` with disabled validation mode
     m_main_pipeline = std::make_shared<ContinuousBatchingForEagle3DecodingImpl>(main_model,
                                                                                main_model_tokenizer,
@@ -48,6 +70,17 @@ ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::gen
                                                                                 draft_device,
                                                                                 draft_properties,
                                                                                 false);
+    ov::genai::ModelDesc kv_model_desc;
+    kv_model_desc.model = kv_model;
+    kv_model_desc.device = main_device;
+    // only kv cache information is needed for kv update model
+    if (main_model_desc.properties.count(ov::hint::kv_cache_precision.name()) > 0) {
+        kv_model_desc.properties[ov::hint::kv_cache_precision.name()] = main_model_desc.properties.at(ov::hint::kv_cache_precision.name());
+    } else {
+        GENAI_WARN("Main model properties do not contain kv_cache_precision hint. leave to plugin for default precision.");
+    }
+    m_kv_update_wrapper = std::make_shared<KVUpdateWrapper>(kv_model_desc, m_main_pipeline->get_kv_num());
+   
     m_perf_metrics = ov::genai::SDPerModelsPerfMetrics();
     m_perf_metrics.raw_metrics.m_inference_durations = {{MicroSeconds(0.0f)}};
     m_draft_pipeline->raw_perf_metrics.m_inference_durations = {{ MicroSeconds(0.0f) }};
@@ -163,4 +196,42 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::Eagle3DecodingI
 
     return generate_common(this, input_ids, sampling_params, streamer, token_type_ids, prompt_ids, strategy);
 }
+
+void ContinuousBatchingPipeline::Eagle3DecodingImpl::step() {
+    // call general step for speculative decoding
+    ContinuousBatchingPipeline::SpeculativeDecodingImpl::step();
+    auto main_pipeline = std::dynamic_pointer_cast<ContinuousBatchingForEagle3DecodingImpl>(m_main_pipeline);
+    // specific step for eagle3 to update main model kv cache after validation 
+    {
+        // Launch KV update asynchronously
+        m_kv_update_future = std::async(std::launch::async,
+                                        [wrapper = m_kv_update_wrapper,
+                                            main_pipeline]() mutable {
+                                            auto main_generated_requests = main_pipeline->get_generated_requests();
+                                            std::vector<int32_t> block_update_indices, block_update_begins;
+                                            main_pipeline->collect_block_update_info(main_generated_requests, block_update_indices, block_update_begins);
+                                            ov::Tensor block_indices_tensor = main_pipeline->get_tensor_by_name("block_indices");
+                                            ov::Tensor block_indices_begins_tensor = main_pipeline->get_tensor_by_name("block_indices_begins");
+                                            ov::Tensor block_update_indices_tensor(ov::element::i32,
+                                                                                    {block_update_indices.size()},
+                                                                                    block_update_indices.data());
+                                            ov::Tensor block_update_indices_begins_tensor(ov::element::i32,
+                                                                                            {block_update_begins.size()},
+                                                                                            block_update_begins.data());
+
+                                            for (size_t decoder_layer_id = 0; decoder_layer_id < wrapper->m_kv_layers_num; ++decoder_layer_id) {
+                                                wrapper->m_request.set_tensor(std::string("key_cache.") + std::to_string(decoder_layer_id), main_pipeline->get_key_cache(decoder_layer_id));
+                                                wrapper->m_request.set_tensor(std::string("value_cache.") + std::to_string(decoder_layer_id), main_pipeline->get_value_cache(decoder_layer_id));
+                                            }
+
+                                            wrapper->m_request.set_tensor("block_indices", block_indices_tensor);
+                                            wrapper->m_request.set_tensor("block_indices_begins", block_indices_begins_tensor);
+                                            wrapper->m_request.set_tensor("block_update_indices", block_update_indices_tensor);
+                                            wrapper->m_request.set_tensor("block_update_indices_begins", block_update_indices_begins_tensor);
+
+                                            wrapper->m_request.infer();
+                                        });
+    }
+}
+
 }  // namespace ov::genai

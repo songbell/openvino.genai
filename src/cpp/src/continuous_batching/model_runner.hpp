@@ -514,7 +514,7 @@ public:
         if (sequence_group_type == SequenceGroupType::TOKENS && !m_cached_input_ids) {
             m_request.set_tensor("input_ids", input_ids);
         }
-        if (!_is_hs_import() && !_is_hs_internal()) {
+        if (_is_hs_export() &&!_is_hs_import() && !_is_hs_internal()) {
             _set_query_to_query_tensors(sequence_groups, scheduler_output);
         }
         else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
@@ -683,8 +683,6 @@ private:
                                      const Scheduler::Output& scheduler_output) {
         std::string qq_bias_name = "qq_bias";
         std::string qq_bias_begin_name = "qq_bias_begins";
-        std::string remap_name = "block_update_indices";
-        std::string remap_begin_name = "block_update_indices_begins";
         size_t num_sequence_groups = scheduler_output.m_scheduled_sequence_groups_ids.size();
         size_t total_spec_tokens = 0;
         auto qq_bias_begin_tensor = m_request.get_tensor(qq_bias_begin_name);
@@ -727,57 +725,6 @@ private:
                             tree_mask_data[offset + row * num_speculated_tokens + col] = tree_mask[row][col];
                         }
                     }
-                }
-            }
-        }
-
-        size_t total_indices_to_remap = 0;
-        std::map<size_t, std::map<size_t, size_t>> remap_indices;
-        auto block_update_indices_begin_tensor = m_request.get_tensor(remap_begin_name);
-        block_update_indices_begin_tensor.set_shape({num_sequence_groups + 1});
-        auto block_update_indices_begin_data = block_update_indices_begin_tensor.data<int32_t>();
-        block_update_indices_begin_data[0] = 0;
-        for (size_t i = 0; i < num_sequence_groups; ++i) {
-            size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
-            SequenceGroup::CPtr sequence_group = sequence_groups[seq_group_id];
-            std::vector<Sequence::CPtr> running_sequences = sequence_group->get_running_sequences();
-            size_t num_running_sequences = running_sequences.size();
-            auto validated_indices = running_sequences[0]->get_eagle_metadata().validated_indices;
-            if (validated_indices.size() == 0) {
-                continue;
-            }
-
-            OPENVINO_ASSERT(num_running_sequences == 1, "only support 1 running sequence in eagle3 mode");
-
-            auto num_processed_tokens = sequence_group->get_num_processed_tokens();
-            size_t prev_num_processed_tokens = num_processed_tokens - validated_indices.size();
-            size_t index = prev_num_processed_tokens;
-            for (auto& idx : validated_indices) {
-                if (prev_num_processed_tokens + idx == index) {
-                    // skip indexes which map to themselves
-                    index++;
-                    continue;
-                }
-                remap_indices[i].emplace(prev_num_processed_tokens + idx, index);  // src idx, dst idx
-                index++;
-            }
-            auto it = remap_indices.find(i);
-            if (it != remap_indices.end() && !it->second.empty()) {
-                total_indices_to_remap += remap_indices[i].size();
-            }
-            block_update_indices_begin_data[i + 1] = static_cast<int32_t>(total_indices_to_remap);
-        }
-        m_request.get_tensor(remap_name).set_shape({remap_indices.size() * 2}); // src and dst, block and slot
-        // fill in the tensor
-        if (remap_indices.size() > 0) {
-            int32_t* remap_data = m_request.get_tensor(remap_name).data<int32_t>();
-            uint32_t m_kv_remap_indices_filled_count = 0;
-            for (auto & [seq_group_id, indices_map] : remap_indices) {
-                auto running_sequences = sequence_groups[seq_group_id]->get_running_sequences();
-                for (const auto& [src_idx, dst_idx] : indices_map) {
-                    size_t tensor_offset = 2 * (m_kv_remap_indices_filled_count++);
-                    remap_data[tensor_offset]     = static_cast<int32_t>(src_idx);
-                    remap_data[tensor_offset + 1] = static_cast<int32_t>(dst_idx);
                 }
             }
         }

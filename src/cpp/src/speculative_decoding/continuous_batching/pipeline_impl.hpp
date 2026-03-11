@@ -28,6 +28,12 @@ public:
     void pull_awaiting_requests(bool is_pause_request = false);
     GeneratedRequests get_generated_requests();
     UpdateRequestResult update_request(uint64_t request_id, const GeneratedSequences& candidates, bool is_update_logit_processor);
+    //void update_kv_update_info(uint64_t request_id, const GeneratedSequences& candidates);
+    void collect_block_update_info(const GeneratedRequests& main_generated_requests,
+                                   std::vector<int32_t>& block_update_indices,
+                                   std::vector<int32_t>& block_update_begins) const;
+    size_t& get_kv_num() { return m_num_decoder_layers; }
+
     bool is_requests_empty();
 
     size_t get_processed_tokens_per_iteration();
@@ -40,6 +46,7 @@ protected:
     void finish_request(SequenceGroup::Ptr request);
     void _pull_awaiting_requests() override {};
     bool eagle_mode_enabled = false;
+    std::vector<int32_t> block_update_begins = {0}, block_update_indices;
 };
 
 class ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl
@@ -53,7 +60,8 @@ public:
                                             const SchedulerConfig& scheduler_config,
                                             const std::string& device,
                                             const ov::AnyMap& plugin_config,
-                                            bool is_validation_mode_enabled)
+                                            bool is_validation_mode_enabled,
+                                            const std::shared_ptr<ov::Model>& kv_update_model = nullptr)
         : ContinuousBatchingForSpeculativeDecodingImpl(model,
                                                        tokenizer,
                                                        generation_config,
@@ -121,6 +129,25 @@ public:
         if (m_model_runner) {
             m_model_runner->enable_hidden_state_internal(is_needed);
         }
+    }
+    ov::Tensor get_tensor_by_name(const std::string& name) {
+        if (m_model_runner) {
+            return m_model_runner->get_infer_request().get_tensor(name);
+        }
+        return {};
+    }
+    ov::Tensor get_key_cache(size_t decoder_layer_id) const {
+        if (m_scheduler) {
+            return m_scheduler->get_key_cache(decoder_layer_id);
+        }
+        return {};
+    }
+
+    ov::Tensor get_value_cache(size_t decoder_layer_id) const {
+        if (m_scheduler) {
+            return m_scheduler->get_value_cache(decoder_layer_id);
+        }
+        return {};
     }
 };
 }

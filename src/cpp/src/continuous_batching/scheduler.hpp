@@ -82,7 +82,12 @@ public:
         m_cache_manager.reset();
         m_block_manager.reset();
     }
-
+    ov::Tensor get_key_cache(size_t decoder_layer_id) const {
+        return m_cache_manager->get_key_cache(decoder_layer_id);
+    }
+    ov::Tensor get_value_cache(size_t decoder_layer_id) const {
+        return m_cache_manager->get_value_cache(decoder_layer_id);
+    }
     Output schedule(std::vector<SequenceGroup::Ptr>& sequence_groups) {
         Output scheduler_output;
         // map of src -> dst blocks copies, which need to be performed by CacheManager
