@@ -674,7 +674,7 @@ public:
     float assistant_confidence_threshold = 0.f;
     size_t num_assistant_tokens = 0;
     size_t max_ngram_size = 0;
-    struct eagle_params {
+    struct EagleParams {
         // eagle/model/cnets.py
         size_t branching_factor = 1; // top-k
         size_t tree_depth = 1; // How deep to look ahead, eagle tree depth, draft will run depth + 1(tree init) levels
