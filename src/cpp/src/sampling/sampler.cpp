@@ -1432,6 +1432,7 @@ void Sampler::clear_request_info(uint64_t request_id) {
     m_beam_search_info.erase(request_id);
     m_logit_processors.erase(request_id);
     m_stop_strings.erase(request_id);
+    m_tree_search_info.erase(request_id);
 }
 
 int64_t Sampler::GroupBeamSearcher::Group::finish(Beam beam, const ov::genai::GenerationConfig& sampling_params) {
