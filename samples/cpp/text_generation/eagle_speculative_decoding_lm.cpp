@@ -48,8 +48,8 @@ int main(int argc, char* argv[]) try {
     ov::genai::GenerationConfig config;
     config.max_new_tokens = max_new_tokens;
     // Eagle specific parameters
-    config.eagle_tree_params.branching_factor = branching_factor; // Number of candidate tokens to consider at each level
-    config.eagle_tree_params.tree_depth = depth; // How deep to explore the token tree
+    config.tree_params.branching_factor = branching_factor; // Number of candidate tokens to consider at each level
+    config.tree_params.tree_depth = depth; // How deep to explore the token tree
     config.num_assistant_tokens = atoi(argv[6]);
     config.num_return_sequences = 1; // only support 1
 

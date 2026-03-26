@@ -30,7 +30,11 @@ void KVUpdateWrapper::update_request(uint64_t request_id, const GeneratedSequenc
 ContinuousBatchingPipeline::Eagle3DecodingImpl::Eagle3DecodingImpl(const ov::genai::ModelDesc& main_model_desc,
                                                                  const ov::genai::ModelDesc& draft_model_desc,
                                                                  const std::vector<int32_t>& hidden_layers) {
-    auto scheduler_configs = init_speculative_models(main_model_desc, draft_model_desc);
+    // Enable query-to-query bias for Eagle3 only in speculative model preparation.
+    // Keep runtime compile properties unchanged.
+    ov::genai::ModelDesc main_model_desc_with_qq_bias = main_model_desc;
+    main_model_desc_with_qq_bias.properties["query_to_query_bias"] = true;
+    auto scheduler_configs = init_speculative_models(main_model_desc_with_qq_bias, draft_model_desc);
     auto main_model = main_model_desc.model;
     auto draft_model = draft_model_desc.model;
     OPENVINO_ASSERT(main_model && draft_model);
@@ -171,7 +175,7 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::Eagle3DecodingI
             main_cfg.num_assistant_tokens = m_main_pipeline->default_num_assistant_tokens;
             draft_cfg.num_assistant_tokens = main_cfg.num_assistant_tokens;
         }
-        main_cfg.eagle_tree_params.tree_depth = 0; // disable tree search in main model
+        main_cfg.tree_params.branching_factor = 1; // reset tree params for main model
 
         draft_cfg.ignore_eos = true;
         draft_cfg.stop_strings = {};
@@ -185,7 +189,7 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::Eagle3DecodingI
         OPENVINO_ASSERT(!streamer_ptr->has_callback() ||
                         (input_ids.size() == 1 &&
                          (sampling_params[0].is_greedy_decoding() || sampling_params[0].is_tree_search())),
-                        "Eagle3 streaming only supports batch size=1 with greedy");
+                        "Eagle3 streaming only supports batch size=1 with greedy decoding or tree search");
     };
     strategy.start_timer = [](){
         return std::chrono::steady_clock::now();

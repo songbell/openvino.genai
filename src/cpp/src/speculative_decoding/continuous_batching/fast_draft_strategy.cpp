@@ -37,8 +37,8 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(con
     bool allow_score_aggregation = true;
     bool allow_xattention = false;
     bool allow_cache_rotation = false;
-    bool main_allow_qq_bias = true;
-    bool draft_allow_qq_bias = false;
+    // check if query_to_query attention is needed for main model
+    bool main_allow_qq_bias = main_model_desc.properties.count("query_to_query_bias") > 0 && main_model_desc.properties.at("query_to_query_bias").as<bool>();
     ov::pass::SDPAToPagedAttention(main_model_desc.scheduler_config.use_cache_eviction,
                                    main_model_desc.scheduler_config.use_cache_eviction,
                                    allow_score_aggregation,
@@ -50,9 +50,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(con
                                    main_model_desc.scheduler_config.use_cache_eviction,
                                    allow_score_aggregation,
                                    allow_cache_rotation,
-                                   allow_xattention,
-                                   false,
-                                   draft_allow_qq_bias).run_on_model(draft_model);
+                                   allow_xattention).run_on_model(draft_model);
 
     utils::apply_gather_before_matmul_transformation(main_model);
     utils::apply_gather_before_matmul_transformation(draft_model);
@@ -159,13 +157,13 @@ bool ContinuousBatchingPipeline::SpeculativeDecodingImpl::has_non_finished_reque
 void print_generated_request(const ov::genai::GeneratedRequests& requests) {
     for (const auto& request : requests) {
         for (const auto& sequence : request.second) {
-            // std::cout << "request_id: " << request.first << " | sequence_id: " << sequence.first << " | ";
+            std::cout << "request_id: " << request.first << " | sequence_id: " << sequence.first << " | ";
             for (const auto& token_id : sequence.second.token_ids) {
-                // std::cout << token_id << " ";
+                std::cout << token_id << " ";
             }
-            // std::cout << std::endl;
+            std::cout << std::endl;
         }
-        // std::cout << std::endl;
+        std::cout << std::endl;
     }
 }
 

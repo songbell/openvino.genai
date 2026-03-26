@@ -91,13 +91,12 @@ class Sampler {
                                                         LogitProcessor& logit_processor, const std::pair<size_t, std::set<std::string>>& stop_strings,
                                                         bool is_validation_mode_enabled);
 
+    std::mutex m_search_info_mutex;
     // request ID => beam search tracking information
     std::map<uint64_t, GroupBeamSearcher> m_beam_search_info;
-    std::mutex m_beam_search_info_mutex;
 
     // request ID => tree search tracking information
-    std::map<uint64_t, TreeSearcher> m_tree_search_info;
-    std::mutex m_tree_search_info_mutex;
+    std::map<uint64_t, std::shared_ptr<TreeSearcher>> m_tree_search_info;
     std::mt19937 rng_engine;
     size_t seed = rng_engine.default_seed;
     // { request_id, logit_processor }
@@ -150,8 +149,7 @@ public:
         // beam is made on top of sequence
         float m_log_prob = 0.0f;
         int64_t m_token_id = -1;
-        int m_tree_layer = 0;   // layer in the tree structure
-        int64_t m_node_id = 0;
+
         // cumulative log probabilities
         float m_score = -std::numeric_limits<float>::infinity();
 
@@ -167,6 +165,7 @@ public:
         return left.m_score > right.m_score;
     }
 
+protected:
     SequenceGroup::Ptr m_sequence_group;
     ov::genai::GenerationConfig m_parameters;
     Tokenizer m_tokenizer;
@@ -181,89 +180,85 @@ public:
 class Sampler::TreeSearcher : public Sampler::Searcher {
     void tree_reset(SequenceGroup::Ptr& sequence_group);
     struct CandidateNode {
-        Beam candidate_beam;
+        int64_t token_id = -1;
+        float score = -std::numeric_limits<float>::infinity();
+        int tree_layer = 0;
         std::vector<std::shared_ptr<CandidateNode>> children;
         std::weak_ptr<CandidateNode> parent;
 
-        uint64_t get_id() const {
-            return candidate_beam.m_node_id;
-        }
-        CandidateNode(Beam beam) : candidate_beam(std::move(beam)) {}
+        CandidateNode() = default;
+        CandidateNode(int64_t token_id, float score, int tree_layer)
+            : token_id(token_id), score(score), tree_layer(tree_layer) {}
     };
-    class Eagle2CandidateGraph {
-    public:
-        Eagle2CandidateGraph(Beam root_beam, int k = 0, int max_depth = 0)
-            : total_tokens(k),
-              max_depth(max_depth),
-              current_depth(0),
-              next_node_id(1) {
-            root_beam.m_node_id = 0;  // Root always has ID 0
-            root_beam.m_tree_layer = 0;
-            root = std::make_shared<CandidateNode>(std::move(root_beam));
 
-            node_map[0] = root;
-            layer_to_nodes[0].push_back(root);  // for access to nodes on same layer
+    class TreeCandidateGraph {
+    public:
+        using NodePtr = std::shared_ptr<CandidateNode>;
+
+        TreeCandidateGraph(const Beam& root_beam, int total_tokens = 0, int depth = 0)
+            : total_tokens(total_tokens),
+              max_depth(depth),
+              current_depth(0) {
+            root = std::make_shared<CandidateNode>(root_beam.m_token_id, root_beam.m_score, 0);
+            layer_to_nodes.resize(1);
+            layer_to_nodes[0].push_back(root);
         }
 
-        void add_candidate(Beam& new_beam, uint64_t parent_node_id) {
-            if (new_beam.m_tree_layer > max_depth) {
-                return;
+        NodePtr get_root() const {
+            return root;
+        }
+
+        NodePtr add_candidate(const Beam& beam, const NodePtr& parent_node) {
+            OPENVINO_ASSERT(parent_node != nullptr, "Parent node is null in candidate graph");
+
+            const int next_layer = parent_node->tree_layer + 1;
+            if (next_layer > max_depth) {
+                return nullptr;
             }
 
-            auto parent_it = node_map.find(parent_node_id);
-            if (parent_it == node_map.end()) {
-                OPENVINO_THROW("Parent node not found in candidate graph");
-            }
-
-            auto parent_node = parent_it->second;
-
-            // Assign new node ID and update beam
-            new_beam.m_node_id = next_node_id++;
-            new_beam.m_tree_layer = parent_node->candidate_beam.m_tree_layer + 1;
-
-            auto new_node = std::make_shared<CandidateNode>(new_beam);
+            auto new_node = std::make_shared<CandidateNode>(beam.m_token_id, beam.m_score, next_layer);
             new_node->parent = parent_node;
-
-            // Add to parent's children
             parent_node->children.push_back(new_node);
 
-            // Update mappings
-            node_map[new_node->get_id()] = new_node;
-            layer_to_nodes[new_node->candidate_beam.m_tree_layer].push_back(new_node);
+            if (layer_to_nodes.size() <= static_cast<size_t>(next_layer)) {
+                layer_to_nodes.resize(static_cast<size_t>(next_layer) + 1);
+            }
+            layer_to_nodes[static_cast<size_t>(next_layer)].push_back(new_node);
 
-            // Update current depth
-            current_depth = std::max(current_depth, new_node->candidate_beam.m_tree_layer);
+            current_depth = std::max(current_depth, next_layer);
+            return new_node;
         }
-        bool is_ancestor(uint64_t ancestor_id, uint64_t node_id) {
-            auto it = node_map.find(node_id);
-            if (it == node_map.end()) return false;
+        bool is_ancestor(const NodePtr& ancestor, const NodePtr& node) const {
+            if (!ancestor || !node) {
+                return false;
+            }
 
-            auto node = it->second;
-            while (node) {
-                if (node->get_id() == ancestor_id) {
+            auto cur = node;
+            const CandidateNode* ancestor_raw = ancestor.get();
+            while (cur) {
+                if (cur.get() == ancestor_raw) {
                     return true;
                 }
-                auto parent_ptr = node->parent.lock();
-                node = parent_ptr;
+                cur = cur->parent.lock();
             }
             return false;
         }
-        std::vector<Beam> get_top_k_candidates() {
+        std::vector<NodePtr> get_top_k_candidates() const {
             if (total_tokens <= 0)
                 return {};
 
             // Use min-heap to efficiently get top-k candidates (excluding root)
-            auto cmp = [](const std::shared_ptr<CandidateNode>& a, const std::shared_ptr<CandidateNode>& b) {
-                return a->candidate_beam.m_score > b->candidate_beam.m_score;  // min-heap
+            auto cmp = [](const NodePtr& a, const NodePtr& b) {
+                return a->score > b->score;  // min-heap
             };
 
-            std::priority_queue<std::shared_ptr<CandidateNode>,
-                                std::vector<std::shared_ptr<CandidateNode>>,
+            std::priority_queue<NodePtr,
+                                std::vector<NodePtr>,
                                 decltype(cmp)>
                 min_heap(cmp);
 
             // BFS traversal to find all candidates (excluding root)
-            std::queue<std::shared_ptr<CandidateNode>> bfs_queue;
+            std::queue<NodePtr> bfs_queue;
             bfs_queue.push(root);
 
             while (!bfs_queue.empty()) {
@@ -273,7 +268,7 @@ class Sampler::TreeSearcher : public Sampler::Searcher {
                 if (node != root) {
                     if (min_heap.size() < static_cast<size_t>(total_tokens)) {
                         min_heap.push(node);
-                    } else if (node->candidate_beam.m_score > min_heap.top()->candidate_beam.m_score) {
+                    } else if (node->score > min_heap.top()->score) {
                         min_heap.pop();
                         min_heap.push(node);
                     }
@@ -284,128 +279,90 @@ class Sampler::TreeSearcher : public Sampler::Searcher {
                 }
             }
 
-            // Extract results and sort by score (descending)
-            std::vector<Beam> result;
+            std::vector<NodePtr> result;
             result.reserve(min_heap.size() + 1);
 
-            result.push_back(root->candidate_beam);
+            result.push_back(root);
 
             while (!min_heap.empty()) {
-                result.push_back(min_heap.top()->candidate_beam);
+                result.push_back(min_heap.top());
                 min_heap.pop();
             }
 
-            std::sort(result.begin(), result.end(), [](const Beam& a, const Beam& b) {
-                return a.m_score > b.m_score;
+            std::sort(result.begin(), result.end(), [](const NodePtr& a, const NodePtr& b) {
+                return a->score > b->score;
             });
 
             return result;
         }
-        int get_parent_id(uint64_t node_id) const {
-            auto it = node_map.find(node_id);
-            if (it == node_map.end()) return -1;
-            auto node = it->second;
-            auto parent_ptr = node->parent.lock();
-            if (!parent_ptr) return -1;
-            return static_cast<int>(parent_ptr->get_id());
-        }
-        std::vector<std::shared_ptr<CandidateNode>>get_current_layer_candidates() {
-            return layer_to_nodes[current_depth];
-        }
-        void print_tree() {  // for debugging purposes
-            // std::cout << "Eagle2 Candidate Tree (Depth: " << current_depth << ")\n";
-            print_node(root, 0);
+        std::vector<NodePtr> get_current_layer_candidates() const {
+            if (current_depth < 0 || layer_to_nodes.size() <= static_cast<size_t>(current_depth)) {
+                return {};
+            }
+            return layer_to_nodes[static_cast<size_t>(current_depth)];
         }
 
-        std::vector<Beam> get_leaf_nodes_from_candidates(const std::vector<Beam>& candidates) {
-            std::vector<Beam> leaf_nodes;
-            std::unordered_set<uint64_t> candidate_ids;
+        std::vector<NodePtr> get_leaf_nodes_from_candidates(const std::vector<NodePtr>& candidates) const {
+            std::vector<NodePtr> leaf_nodes;
+            std::unordered_set<const CandidateNode*> candidate_ids;
 
             // Build set of candidate node IDs
-            for (const auto& beam : candidates) {
-                candidate_ids.insert(beam.m_node_id);
+            for (const auto& node : candidates) {
+                candidate_ids.insert(node.get());
             }
 
             // Check each candidate to see if it's a leaf in the selected set
-            for (const auto& candidate_beam : candidates) {
-                auto node_it = node_map.find(candidate_beam.m_node_id);
-                if (node_it == node_map.end())
-                    continue;
-
-                auto node = node_it->second;
-
+            for (const auto& candidate : candidates) {
                 // Check if this node has any children in the candidate set
                 bool has_candidate_child = false;
-                for (const auto& child : node->children) {
-                    if (candidate_ids.count(child->get_id()) > 0) {
+                for (const auto& child : candidate->children) {
+                    if (candidate_ids.count(child.get()) > 0) {
                         has_candidate_child = true;
                         break;
                     }
                 }
 
                 if (!has_candidate_child) {
-                    leaf_nodes.push_back(candidate_beam);
+                    leaf_nodes.push_back(candidate);
                 }
             }
 
             return leaf_nodes;
         }
 
-        std::vector<int64_t> get_path_to_node(uint64_t node_id) {
-            std::vector<int64_t> path;
-            auto it = node_map.find(node_id);
-            if (it == node_map.end()) return path; // empty if not found
-
-            auto node = it->second;
-            while (node) {
-                path.push_back(node->candidate_beam.m_node_id);
-                auto parent_ptr = node->parent.lock();
-                node = parent_ptr;
+        std::vector<NodePtr> get_path_to_node(const NodePtr& node) const {
+            std::vector<NodePtr> path;
+            auto current = node;
+            while (current) {
+                path.push_back(current);
+                current = current->parent.lock();
             }
             std::reverse(path.begin(), path.end());
-            return {path};
+            return path;
         }
-        std::vector<std::vector<int64_t>> ss_token;
-        std::vector<std::vector<int32_t>> parents_list;
-        std::list<float> scores_list;
-        std::vector<int> topk_cs_index;
-        std::vector<std::vector<bool>> tree_mask;
+
     private:
-        std::shared_ptr<CandidateNode> root;
-        uint64_t next_node_id;  // for new node
-        std::unordered_map<uint64_t, std::shared_ptr<CandidateNode>> node_map;
-        std::unordered_map<size_t, std::vector<std::shared_ptr<CandidateNode>>> layer_to_nodes;
+        NodePtr root;
+        std::vector<std::vector<NodePtr>> layer_to_nodes;
 
         int total_tokens;
         int max_depth;
         int current_depth;
-
-        void print_node(const std::shared_ptr<CandidateNode>& node, int depth) {
-            std::string indent(depth * 2, ' ');
-
-            if (node == root) {
-                std::cout << indent << "[ROOT] ID: " << node->get_id() << "\n";
-            } else {
-                std::cout << indent << "ID: " << node->get_id() << " Token: " << node->candidate_beam.m_token_id
-                          << " Score: " << node->candidate_beam.m_score
-                          << " Layer: " << node->candidate_beam.m_tree_layer << "\n";
-            }
-
-            for (const auto& child : node->children) {
-                print_node(child, depth + 1);
-            }
-        }
     };
     size_t m_tree_layer_counter = 0;
     size_t m_past_generate_len = 0;
-    std::shared_ptr<Eagle2CandidateGraph> m_eagle2_candidate_graph;
+    std::shared_ptr<TreeCandidateGraph> m_tree_candidate_graph;
     std::vector<Beam> m_beams;
+    std::vector<TreeCandidateGraph::NodePtr> m_beam_nodes;
     uint64_t m_org_group_id = 0;
     int64_t* m_d2t; // Draft-to-target token ID offset
 public:
     explicit TreeSearcher(SequenceGroup::Ptr sequence_group, ov::Tensor d2t);
-
+    bool is_depth_reached() const {
+        return m_tree_layer_counter >= m_parameters.tree_params.tree_depth;
+    }
     void select_top_k(const ov::Tensor& logits, SamplerOutput& sampler_output, LogitProcessor& logit_processor);
+    void finalize_tree(SamplerOutput& sampler_output, LogitProcessor& logit_processor);
 };
 
 class Sampler::GroupBeamSearcher : public Sampler::Searcher {

@@ -41,7 +41,7 @@ class Sequence {
         static uint64_t m_counter = 0;
         return m_counter++;
     }
-    ov::genai::utils::EagleMetaData m_eagle_metadata;
+    utils::TreeMetaData m_tree_metadata;
     TokenIds m_generated_ids;
     LogProbs m_generated_log_probs;
     uint64_t m_grouped_id;
@@ -158,12 +158,12 @@ public:
         return m_hidden_state;
     }
 
-    void set_eagle_metadata(const ov::genai::utils::EagleMetaData& metadata) {
-        m_eagle_metadata = metadata;
+    void set_tree_metadata(const utils::TreeMetaData& metadata) {
+        m_tree_metadata = metadata;
     }
 
-    const ov::genai::utils::EagleMetaData& get_eagle_metadata() const {
-        return m_eagle_metadata;
+    const utils::TreeMetaData& get_tree_metadata() const {
+        return m_tree_metadata;
     }
     // removes n last tokens and updates cumulative log prob
     // used to remove stop_string from the output

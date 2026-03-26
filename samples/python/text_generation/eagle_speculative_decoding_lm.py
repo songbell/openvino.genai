@@ -40,8 +40,8 @@ def main():
     # `assistant_confidence_threshold`.
     # NOTE: `assistant_confidence_threshold` is supported only by ContinuousBatching backend.
     # config.assistant_confidence_threshold = 0.4
-    config.eagle_tree_params.branching_factor = 8
-    config.eagle_tree_params.tree_depth = 3
+    config.tree_params.branching_factor = 8
+    config.tree_params.tree_depth = 3
     # Since the streamer is set, the results will be printed 
     # every time a new token is generated and put into the streamer queue.
     res = pipe.generate([args.prompt], config, streamer)

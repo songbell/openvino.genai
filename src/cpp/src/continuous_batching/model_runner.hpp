@@ -139,8 +139,6 @@ class ModelRunner {
     ov::Tensor m_cached_max_context_len;
     ov::Tensor m_cached_score_aggregation_window;
     ov::Tensor m_cached_token_type_ids;
-    ov::Tensor m_cached_qq_bias;
-    ov::Tensor m_cached_kv_remap_indices_begins;
 public:
     /**
      * Constructs the ModelRunner.
@@ -413,7 +411,7 @@ public:
                 for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id, ++gathering_current_index) {
                     // compute token for current sequence
                     if (sequence_group_type == SequenceGroupType::TOKENS) {
-                        auto tree_pos_ids = sequence->get_eagle_metadata().tree_position_ids;
+                        auto tree_pos_ids = sequence->get_tree_metadata().tree_position_ids;
                         // suppose tree_pos_ids [0, 1, 1, 2, 2, 2, 2,...] means the first token is at position 0 in the tree,
                         // the second and third tokens are at position 1, and the rest tokens are at position 2, etc.
                         if (!tree_pos_ids.empty()) {
@@ -514,7 +512,7 @@ public:
         if (sequence_group_type == SequenceGroupType::TOKENS && !m_cached_input_ids) {
             m_request.set_tensor("input_ids", input_ids);
         }
-        if (_is_hs_export() &&!_is_hs_import() && !_is_hs_internal()) {
+        if (_is_hs_export_only()) {
             _set_query_to_query_tensors(sequence_groups, scheduler_output);
         }
         else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
@@ -678,53 +676,78 @@ private:
     bool _is_hs_export()   const { return m_hidden_state_flags & HS_EXPORT; }
     bool _is_hs_import()   const { return m_hidden_state_flags & HS_IMPORT; }
     bool _is_hs_internal() const { return m_hidden_state_flags & HS_INTERNAL; }
+    bool _is_hs_export_only() const {
+        return (m_hidden_state_flags & (HS_EXPORT | HS_IMPORT | HS_INTERNAL)) == HS_EXPORT;
+    }
 
+    /**
+     * @brief Prepares query-to-query bias tensors for Eagle3 tree decoding.
+     *
+     * Fills two model inputs:
+     * - `qq_bias_begins`: prefix sums of speculative token counts for scheduled sequence groups.
+     * - `qq_bias`: flattened tree-mask data for scheduled groups that are in tree-decoding stage
+     *   after the prompt has been fully processed.
+     *
+     * @param sequence_groups Full list of sequence groups; entries are accessed by scheduler IDs.
+     * @param scheduler_output Scheduler result with ordered `m_scheduled_sequence_groups_ids`.
+     */
     void _set_query_to_query_tensors(const std::vector<SequenceGroup::Ptr>& sequence_groups,
                                      const Scheduler::Output& scheduler_output) {
-        std::string qq_bias_name = "qq_bias";
-        std::string qq_bias_begin_name = "qq_bias_begins";
-        size_t num_sequence_groups = scheduler_output.m_scheduled_sequence_groups_ids.size();
+        static constexpr const char* k_qq_bias_name = "qq_bias";
+        static constexpr const char* k_qq_bias_begins_name = "qq_bias_begins";
+
+        const std::vector<size_t>& scheduled_ids = scheduler_output.m_scheduled_sequence_groups_ids;
+        const size_t num_sequence_groups = scheduled_ids.size();
+
         size_t total_spec_tokens = 0;
-        auto qq_bias_begin_tensor = m_request.get_tensor(qq_bias_begin_name);
+        size_t cumulative_mask_length = 0;
+        ov::Tensor qq_bias_begin_tensor = m_request.get_tensor(k_qq_bias_begins_name);
         qq_bias_begin_tensor.set_shape({num_sequence_groups + 1});
-        auto qq_bias_begin_data = qq_bias_begin_tensor.data<int32_t>();
+        int32_t* qq_bias_begin_data = qq_bias_begin_tensor.data<int32_t>();
         qq_bias_begin_data[0] = 0;
+
         for (size_t i = 0; i < num_sequence_groups; ++i) {
-            size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
-            SequenceGroup::CPtr sequence_group = sequence_groups[i];
-            size_t num_running_sequences = sequence_group->num_running_seqs();
-            OPENVINO_ASSERT(num_running_sequences == 1, "only support 1 running sequence in eagle3 mode");
-            // skip the prompt tokens
-            auto num_processed_tokens = sequence_group->get_num_processed_tokens();
-            auto is_tree_decoding = sequence_group->get_running_sequences()[0]->get_eagle_metadata().tree_mask.size() > 0;
+            const size_t seq_group_id = scheduled_ids[i];
+            SequenceGroup::CPtr sequence_group = sequence_groups[seq_group_id];
+            OPENVINO_ASSERT(sequence_group->num_running_seqs() == 1, "only support 1 running sequence in eagle3 mode");
+
             // only count speculated tokens after the prompt for qq bias
+            const size_t num_processed_tokens = sequence_group->get_num_processed_tokens();
+            const bool is_tree_decoding = !sequence_group->get_running_sequences()[0]->get_tree_metadata().tree_mask.empty();
             if (is_tree_decoding && num_processed_tokens >= sequence_group->get_prompt_len()) {
-                total_spec_tokens += sequence_group->get_num_scheduled_tokens();
-            }
+                auto scheduled_tokens = sequence_group->get_num_scheduled_tokens();
+                cumulative_mask_length += scheduled_tokens * scheduled_tokens;
+                total_spec_tokens += scheduled_tokens;
+            }          
             qq_bias_begin_data[i + 1] = static_cast<int32_t>(total_spec_tokens);
         }
 
-        if (total_spec_tokens > 0) {
-            m_request.get_tensor(qq_bias_name).set_shape({total_spec_tokens * total_spec_tokens});
-            auto qq_bias_tensor = m_request.get_tensor(qq_bias_name);
-            auto tree_mask_data = qq_bias_tensor.data<uint8_t>();
-            // fill in the tree mask tensor if we have tokens to speculate
-            for (size_t i = 0; i < num_sequence_groups; ++i) {
-                size_t seq_group_id = scheduler_output.m_scheduled_sequence_groups_ids[i];
-                SequenceGroup::CPtr sequence_group = sequence_groups[seq_group_id];
-                auto sequence = sequence_group->get_running_sequences()[0];
-                auto& eagle_metadata = sequence->get_eagle_metadata();
-                auto tree_mask = eagle_metadata.tree_mask;
-                if (tree_mask.size() > 0) {
-                    auto num_speculated_tokens = tree_mask.size();
-                    OPENVINO_ASSERT(num_speculated_tokens == tree_mask[0].size(),
-                                    "Eagle3 tree mask is expected to be a square matrix.");
-                    auto offset = qq_bias_begin_data[i] * num_speculated_tokens * num_speculated_tokens;
-                    for (size_t row = 0; row < num_speculated_tokens; ++row) {
-                        for (size_t col = 0; col < num_speculated_tokens; ++col) {
-                            tree_mask_data[offset + row * num_speculated_tokens + col] = tree_mask[row][col];
-                        }
-                    }
+        if (total_spec_tokens == 0) {
+            return;
+        }
+
+        ov::Tensor qq_bias_tensor = m_request.get_tensor(k_qq_bias_name);
+        qq_bias_tensor.set_shape({cumulative_mask_length});
+        uint8_t* tree_mask_data = qq_bias_tensor.data<uint8_t>();
+
+        // fill in the tree mask tensor if speculative tokens exist
+        for (size_t i = 0; i < num_sequence_groups; ++i) {
+            const size_t seq_group_id = scheduled_ids[i];
+            SequenceGroup::CPtr sequence_group = sequence_groups[seq_group_id];
+            Sequence::CPtr sequence = sequence_group->get_running_sequences()[0];
+            const auto& tree_mask = sequence->get_tree_metadata().tree_mask;
+            if (tree_mask.empty()) {
+                continue;
+            }
+
+            const size_t num_speculated_tokens = tree_mask.size();
+            OPENVINO_ASSERT(num_speculated_tokens == tree_mask[0].size(),
+                            "Eagle3 tree mask is expected to be a square matrix.");
+
+            const size_t offset = static_cast<size_t>(qq_bias_begin_data[i]) * num_speculated_tokens * num_speculated_tokens;
+            for (size_t row = 0; row < num_speculated_tokens; ++row) {
+                for (size_t col = 0; col < num_speculated_tokens; ++col) {
+                    tree_mask_data[offset + row * num_speculated_tokens + col] = tree_mask[row][col];
                 }
             }
         }

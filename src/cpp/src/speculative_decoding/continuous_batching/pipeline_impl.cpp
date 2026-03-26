@@ -63,7 +63,7 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::get_ge
         for (const auto& sequence : request->get_running_sequences()) {
             const auto& sequence_id = sequence->get_grouped_id();
             OPENVINO_ASSERT(!generated_request.count(sequence_id));
-            generated_request.insert({{sequence_id, { sequence->get_generated_ids(), sequence->get_generated_log_probs(), sequence->get_hidden_state(), sequence->get_eagle_metadata() }}});
+            generated_request.insert({{sequence_id, { sequence->get_generated_ids(), sequence->get_generated_log_probs(), sequence->get_hidden_state(), sequence->get_tree_metadata() }}});
         }
     }
     return result;
@@ -127,8 +127,8 @@ get_prefix_len(
         // adjust the len of prefix in tree mode
         // handle situation of token match but position mismatch
         if (need_adjust) {
-            auto eagle_metadata = running_sequence->get_eagle_metadata();
-            const auto& position_ids = eagle_metadata.tree_position_ids;
+            auto tree_metadata = running_sequence->get_tree_metadata();
+            const auto& position_ids = tree_metadata.tree_position_ids;
             const auto prev_generated_len = running_sequence->get_generated_len() - position_ids.size();
             auto prefix_len_from_last_generated = sequence_prefix_len - prev_generated_len;
             for (size_t i = 0; i < prefix_len_from_last_generated; ++i) {
@@ -277,7 +277,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::c
 
         OPENVINO_ASSERT(sequences.size() == 1);
         for (const auto& seq_entry : sequences) {
-            const auto& validated_indices = seq_entry.second.eagle_metadata.validated_indices;
+            const auto& validated_indices = seq_entry.second.tree_metadata.validated_indices;
             if (validated_indices.empty()) {
                 continue;
             }
@@ -320,58 +320,6 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::c
     }
 }
 
-/*void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update_kv_update_info(GeneratedRequests& generated_request) {
-    std::vector<int32_t> block_update_begins, block_update_indices;
-    block_update_begins.push_back(0);
-    size_t total_indices_to_remap = 0;
-    std::map<size_t, std::map<size_t, size_t>> remap_indices;
-    for (const auto& request : generated_request)
-    for (auto& request : m_requests) {
-        if (request->get_request_id() != request_id) {
-            continue;
-        }
-        std::vector<Sequence::Ptr> running_sequences = request->get_running_sequences();
-        OPENVINO_ASSERT(running_sequences.size() == 1);
-        auto running_sequence = running_sequences[0];
-        if (!candidates.count(running_sequence->get_grouped_id())) {
-            continue;
-        }
-        auto candidate_sequence = candidates.at(running_sequence->get_grouped_id());
-        auto validated_indices = candidate_sequence.validate_indices;
-        if (validated_indices.empty()) {
-            continue;
-        }
-        auto num_processed_tokens = request->get_num_processed_tokens(request_id);
-        size_t prev_num_processed_tokens = num_processed_tokens - validated_indices.size();
-        size_t index = prev_num_processed_tokens;
-        for (auto& idx : validated_indices) {
-            if (prev_num_processed_tokens + idx == index) {
-                // skip indexes which map to themselves
-                index++;
-                continue;
-            }
-            remap_indices[i].emplace(prev_num_processed_tokens + idx, index);  // src idx, dst idx
-            index++;
-        }
-        auto it = remap_indices.find(i);
-        if (it != remap_indices.end() && !it->second.empty()) {
-            total_indices_to_remap += remap_indices[i].size();
-        }
-        block_update_begins.push_back(total_indices_to_remap);
-    }
-    if (remap_indices.size() > 0) {
-        uint32_t m_kv_remap_indices_filled_count = 0;
-        for (auto & [seq_group_id, indices_map] : remap_indices) {
-            auto running_sequences = sequence_groups[seq_group_id]->get_running_sequences();
-            for (const auto& [src_idx, dst_idx] : indices_map) {
-                size_t tensor_offset = 2 * (m_kv_remap_indices_filled_count++);
-                block_update_indices[tensor_offset]     = static_cast<int32_t>(src_idx);
-                block_update_indices[tensor_offset + 1] = static_cast<int32_t>(dst_idx);
-            }
-        }
-    }
-}*/
-
 UpdateRequestResult
 ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update_request(uint64_t request_id,
                                                                                          const GeneratedSequences& candidates,
@@ -400,10 +348,8 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
         } else {
             // update existing sequences by the candidates
             auto& logit_processor = m_sampler->get_logit_processor(request_id);
-            auto need_prefix_adjustion = eagle_mode_enabled && request->get_sampling_parameters().is_tree_search(); // always effective in draft model in eagle tree mode
-            std::tie(min_generated_tokens, min_candidate_len) = get_prefix_len(running_sequences, candidates, need_prefix_adjustion);
-            if (running_sequences.size() != 1)
-                std::cout << "break" << std::endl;
+            auto need_prefix_adjustment = eagle_mode_enabled && request->get_sampling_parameters().is_tree_search(); // always effective in draft model in eagle tree mode
+            std::tie(min_generated_tokens, min_candidate_len) = get_prefix_len(running_sequences, candidates, need_prefix_adjustment);
             OPENVINO_ASSERT(running_sequences.size() == 1);
             auto running_sequence = running_sequences[0];
             {
@@ -411,10 +357,10 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
                 if (!candidates.count(running_sequence->get_grouped_id())) {
                     continue;
                 }
-                auto candidate_sequence = candidates.at(running_sequence->get_grouped_id());
 
                 result.removed_tokens_cnt = remove_tokens_from_sequence(running_sequence, min_generated_tokens, logit_processor);
-                    
+
+                auto candidate_sequence = candidates.at(running_sequence->get_grouped_id());
                 std::vector<int64_t> candidate_token_ids = candidate_sequence.token_ids;
                 std::vector<float> candidate_token_log_probs = candidate_sequence.log_probs;
                 candidate_token_ids.resize(min_candidate_len);
@@ -433,7 +379,7 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
                         // to calculate the number of tokens that needs to do kv cache re-generate in draft model
                         num_tokens_needs_kv_update = shape[0] - 1; // remove the first dim, which is the reliable hidden state from main model
                     } else {
-                        auto tree_indice = candidate_sequence.eagle_metadata.validated_indices;
+                        auto tree_indice = candidate_sequence.tree_metadata.validated_indices;
                         // select the hidden state according to tree indice
                         // for example, the hidden state shape is [10, hidden_size]
                         // retrieve_indices is [0,2,4,6,8], then we need to select hidden states with indice [0,2,4,6,8]
@@ -442,8 +388,6 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
                         const auto& shape = hidden_state.get_shape();
                         OPENVINO_ASSERT(shape[0] >= 1, "Unexpected hidden state shape from the main model.");
                         for (const auto& indice : tree_indice) {
-                            if (indice >= shape[0])
-                                std::cout << "break" << std::endl;
                             OPENVINO_ASSERT(indice < shape[0], "Tree indice is out of range of hidden state.");
                             auto [start_coord, end_coord] = ov::genai::utils::make_roi(shape, 0, indice, indice + 1);
                             selected_hidden_states.push_back(ov::Tensor(hidden_state, start_coord, end_coord));
@@ -454,22 +398,17 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
                         // to calculate the number of tokens that needs to do kv cache re-generate in draft model
                         num_tokens_needs_kv_update = tree_indice.size() - 1;
 
-                        auto total_candidates_count = candidate_sequence.eagle_metadata.tree_position_ids.size();
+                        auto total_candidates_count = candidate_sequence.tree_metadata.tree_position_ids.size();
                         // update the removed token count based on tree structure
                         result.removed_tokens_cnt = total_candidates_count - tree_indice.size() + 1;
-                        //result.inserted_tokens_cnt = 1; //  main model always update 1 bonus
                     }
                 }
-                if (eagle_mode_enabled && m_is_validation_mode_enabled && result.inserted_tokens_cnt > 0) { // update hidden states for main model in validation mode
+                // update hidden states for main model in validation mode
+                if (eagle_mode_enabled && m_is_validation_mode_enabled && result.inserted_tokens_cnt > 0) {
                     // retrieve eagle metadata
-                    auto& eagle_metadata = candidate_sequence.eagle_metadata;
-                    eagle_metadata.validated_indices = running_sequence->get_eagle_metadata().validated_indices;
-                    //std::cout << "set validated indices : ";
-                    for (const auto& idx : eagle_metadata.validated_indices) {
-                        //std::cout << idx << " ";
-                    }
-                    //std::cout << std::endl;
-                    running_sequence->set_eagle_metadata(eagle_metadata);
+                    auto& tree_metadata = candidate_sequence.tree_metadata;
+                    tree_metadata.validated_indices = running_sequence->get_tree_metadata().validated_indices;
+                    running_sequence->set_tree_metadata(tree_metadata);
                 }
             }
             // we should update a logit processor just for draft model to generate the same tokens
@@ -580,9 +519,10 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
                 request->pause_generation(true);
             } else if (request->get_num_processed_tokens() == request->get_prompt_len()) {
                 request->pause_generation(true);
-            } else if (is_stop_token_id_hit_in_sequence_group(request, sampling_params.stop_token_ids) && sampling_params.eagle_tree_params.branching_factor <= 1) {
+            } else if (is_stop_token_id_hit_in_sequence_group(request, sampling_params.stop_token_ids) && sampling_params.tree_params.branching_factor <= 1) {
+                // in branching tree mode, we ignore the stop token, as we may have several candidates at the same tree layer
                 request->pause_generation(true);
-            } else if (sampling_params.eagle_tree_params.tree_depth > 1 && sampling_params.eagle_tree_params.tree_depth + 1 <= generated_tokens_cnt) {
+            } else if (sampling_params.tree_params.tree_depth > 1 && sampling_params.tree_params.tree_depth <= generated_tokens_cnt) {
                 request->pause_generation(true);
             }
             to_generate |= request->can_generate_tokens();

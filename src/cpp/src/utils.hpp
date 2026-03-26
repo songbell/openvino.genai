@@ -77,11 +77,34 @@ struct GenerationFinishInfo
     GenerationStatus streaming_finish_status;
 };
 
-struct EagleMetaData {
-    std::vector<std::vector<uint8_t>> tree_mask;
-    std::vector<std::vector<int64_t>> retrieve_indices;
-    std::vector<int> tree_position_ids;
-    std::vector<int64_t> validated_indices = {};
+template <typename T>
+using Vector = std::vector<T>;
+
+template <typename T>
+using Matrix = Vector<Vector<T>>;
+
+using ByteVector = Vector<uint8_t>;
+using ByteMatrix = Matrix<uint8_t>;
+using Int64Vector = Vector<int64_t>;
+using Int64Matrix = Matrix<int64_t>;
+using UInt32Vector = Vector<uint32_t>;
+using UInt32Matrix = Matrix<uint32_t>;
+
+/**
+ * @brief Tree-decoding metadata carried by a sequence.
+ *
+ * This structure stores per-step tree information used by Eagle-style speculative
+ * decoding and validation.
+ */
+struct TreeMetaData {
+    /// Attention mask for tree nodes among themselves.
+    ByteMatrix tree_mask;
+    /// paths which records mapping from draft nodes to target-token indices used during retrieve/validation.
+    Int64Matrix retrieve_indices;
+    /// Position ids for each node in the current tree step.
+    UInt32Vector tree_position_ids;
+    /// Indices of draft nodes validated by the target model.
+    Int64Vector validated_indices = {};
 };
 
 Tensor init_attention_mask(const Tensor& position_ids);
@@ -341,6 +364,23 @@ bool has_input(const std::shared_ptr<Model>& model, const std::string& name);
  */
 std::pair<ov::Coordinate, ov::Coordinate> make_roi(const std::vector<size_t>& shape, const size_t dim, const size_t range_start, const size_t range_end);
 
+/**
+ * @brief Concatenates tensors along a selected axis.
+ *
+ * Preconditions:
+ * - `tensors` is not empty.
+ * - `axis` is a valid dimension index for every tensor.
+ * - All tensors have the same rank.
+ * - Shapes match on all dimensions except `axis`.
+ * - Tensor element types are expected to be compatible for copy to the resulting tensor.
+ *
+ * The result shape is equal to the first tensor shape, with dimension `axis`
+ * replaced by the sum of that dimension across all input tensors.
+ *
+ * @param tensors Input tensors to concatenate.
+ * @param axis Dimension index used for concatenation.
+ * @return A new tensor containing all input tensors concatenated along `axis`.
+ */
 ov::Tensor concat_tensors(const std::vector<ov::Tensor>& tensors, const size_t axis);
 ov::genai::GenerationConfig get_beam_search_config();
 ov::genai::GenerationConfig get_greedy_config();
