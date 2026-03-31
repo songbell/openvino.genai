@@ -562,12 +562,6 @@ void Sampler::TreeSearcher::select_top_k(const ov::Tensor& logits,
         size_t batch_offset = beam.m_global_beam_idx * seq_len * vocab_size;
         size_t sequence_offset = (seq_len - 1) * vocab_size;
         const float* beam_logits = logits_data + batch_offset + sequence_offset;
-        float max_logit = *std::max_element(beam_logits, beam_logits + vocab_size);
-        float log_sum = std::log(
-            std::accumulate(beam_logits, beam_logits + vocab_size, 0.0f, [max_logit](float accumulated, float to_add) {
-                return accumulated + std::exp(to_add - max_logit);
-            }));
-
         // sort and find the topK
         using Pair = std::pair<float, size_t>;
         auto cmp = [](const Pair& a, const Pair& b) {
@@ -575,14 +569,28 @@ void Sampler::TreeSearcher::select_top_k(const ov::Tensor& logits,
         };
         std::priority_queue<Pair, std::vector<Pair>, decltype(cmp)> minHeap(cmp);
 
+        // One-pass stable log-sum-exp + top-k heap update over the vocabulary.
+        float max_logit = -std::numeric_limits<float>::infinity();
+        double exp_sum = 0.0;
+
         for (size_t i = 0; i < vocab_size; ++i) {
+            const float logit = beam_logits[i];
+
+            if (logit <= max_logit) {
+                exp_sum += std::exp(static_cast<double>(logit - max_logit));
+            } else {
+                exp_sum = exp_sum * std::exp(static_cast<double>(max_logit - logit)) + 1.0;
+                max_logit = logit;
+            }
+
             if (minHeap.size() < m_parameters.tree_params.branching_factor) {
-                minHeap.emplace(beam_logits[i], i);
-            } else if (beam_logits[i] > minHeap.top().first) {
+                minHeap.emplace(logit, i);
+            } else if (logit > minHeap.top().first) {
                 minHeap.pop();
-                minHeap.emplace(beam_logits[i], i);
+                minHeap.emplace(logit, i);
             }
         }
+        float log_sum = std::log(exp_sum);
         // output topK of the logits (Ascending order)
         std::vector<Pair> result;
         while (!minHeap.empty()) {

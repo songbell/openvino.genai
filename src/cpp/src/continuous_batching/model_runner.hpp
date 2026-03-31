@@ -857,7 +857,7 @@ private:
      * @brief Prepares query-to-query bias tensors for Eagle3 tree decoding.
      *
      * Fills two model inputs:
-     * - `qq_bias_begins`: prefix sums of speculative token counts for scheduled sequence groups.
+     * - `qq_bias_begins`: prefix sums of flattened tree-mask lengths for scheduled sequence groups.
      * - `qq_bias`: flattened tree-mask data for scheduled groups that are in tree-decoding stage
      *   after the prompt has been fully processed.
      *
@@ -872,7 +872,6 @@ private:
         const std::vector<size_t>& scheduled_ids = scheduler_output.m_scheduled_sequence_groups_ids;
         const size_t num_sequence_groups = scheduled_ids.size();
 
-        size_t total_spec_tokens = 0;
         size_t cumulative_mask_length = 0;
         ov::Tensor qq_bias_begin_tensor = m_request.get_tensor(k_qq_bias_begins_name);
         qq_bias_begin_tensor.set_shape({num_sequence_groups + 1});
@@ -888,14 +887,13 @@ private:
             const size_t num_processed_tokens = sequence_group->get_num_processed_tokens();
             const bool is_tree_decoding = !sequence_group->get_running_sequences()[0]->get_tree_metadata().tree_mask.empty();
             if (is_tree_decoding && num_processed_tokens >= sequence_group->get_prompt_len()) {
-                auto scheduled_tokens = sequence_group->get_num_scheduled_tokens();
+                const size_t scheduled_tokens = sequence_group->get_num_scheduled_tokens();
                 cumulative_mask_length += scheduled_tokens * scheduled_tokens;
-                total_spec_tokens += scheduled_tokens;
             }          
-            qq_bias_begin_data[i + 1] = static_cast<int32_t>(total_spec_tokens);
+            qq_bias_begin_data[i + 1] = static_cast<int32_t>(cumulative_mask_length);
         }
 
-        if (total_spec_tokens == 0) {
+        if (cumulative_mask_length == 0) {
             return;
         }
 
@@ -909,7 +907,8 @@ private:
             SequenceGroup::CPtr sequence_group = sequence_groups[seq_group_id];
             Sequence::CPtr sequence = sequence_group->get_running_sequences()[0];
             const auto& tree_mask = sequence->get_tree_metadata().tree_mask;
-            if (tree_mask.empty()) {
+            const bool is_after_prompt = sequence_group->get_num_processed_tokens() >= sequence_group->get_prompt_len();
+            if (tree_mask.empty() || !is_after_prompt) {
                 continue;
             }
 
@@ -917,7 +916,7 @@ private:
             OPENVINO_ASSERT(num_speculated_tokens == tree_mask[0].size(),
                             "Eagle3 tree mask is expected to be a square matrix.");
 
-            const size_t offset = static_cast<size_t>(qq_bias_begin_data[i]) * num_speculated_tokens * num_speculated_tokens;
+            const size_t offset = static_cast<size_t>(qq_bias_begin_data[i]);
             for (size_t row = 0; row < num_speculated_tokens; ++row) {
                 for (size_t col = 0; col < num_speculated_tokens; ++col) {
                     tree_mask_data[offset + row * num_speculated_tokens + col] = tree_mask[row][col];
