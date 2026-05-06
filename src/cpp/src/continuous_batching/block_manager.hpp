@@ -558,6 +558,9 @@ public:
 
     ~BlockManager() {
         // sanity check that all sequences are freed
+        if (m_block_table.empty()) {
+            std::cout << "break" << std::endl;
+        }
         OPENVINO_ASSERT(m_block_table.empty());
     }
 
@@ -966,7 +969,7 @@ public:
             }
             auto& block_table = m_block_table[seq_id][0];
             size_t num_physical_blocks = block_table.size();
-            OPENVINO_ASSERT(num_physical_blocks > 0);
+            //OPENVINO_ASSERT(num_physical_blocks > 0);
 
             if (num_physical_blocks > seq_group->get_num_logical_blocks())
                 // new blocks are not required

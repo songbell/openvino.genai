@@ -831,7 +831,9 @@ public:
     void push_empty_outputs() {
         m_generation_stream->push({});
     }
-
+    void update_prompts(TokenIds input_ids) {
+        m_prompt_ids = std::move(input_ids);
+    }
     void push_outputs() {
         GenerationOutputs outputs;
         for (auto& sequence: m_sequences) {

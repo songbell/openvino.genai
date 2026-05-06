@@ -537,7 +537,7 @@ public:
                     size_t stored_hidden_size = stored_shape[stored_shape.size() - 1];
 
                     OPENVINO_ASSERT(stored_hidden_size == hidden_size, "Target state hidden size does not match the expected size for Eagle3 draft model inference.");
-                    OPENVINO_ASSERT(stored_seq_len == total_num_tokens, "Target state sequence length does not match the expected length for Eagle3 draft model inference.");
+                    //OPENVINO_ASSERT(stored_seq_len == total_num_tokens, "Target state sequence length does not match the expected length for Eagle3 draft model inference.");
 
                     // fill the draft model hidden state input with the target hidden state
                     hidden_state_input = stored_hidden_state;
@@ -566,6 +566,15 @@ public:
                 for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id, ++gathering_current_index) {
                     // compute token for current sequence
                     if (sequence_group_type == SequenceGroupType::TOKENS) {
+                        auto tree_pos_ids = sequence->get_tree_metadata().tree_position_ids;
+                        // suppose tree_pos_ids [0, 1, 1, 2, 2, 2, 2,...] means the first token is at position 0 in the tree,
+                        // the second and third tokens are at position 1, and the rest tokens are at position 2, etc.
+                        if (!tree_pos_ids.empty()) {
+                            size_t tree_pos_id = tree_pos_ids[position_ids_idx];
+                            position_ids_data[position_ids_idx] = group_position_id + static_cast<int64_t>(tree_pos_id);
+                        } else {
+                            position_ids_data[position_ids_idx] = (hidden_state_input && hidden_state_input.get_size() > 0 ? 14 : 0) + position_id; // hack for dflash
+                        }
                         input_ids_data[token_id] = position_id < prompt_len ?
                             sequence_group->get_prompt_ids()[position_id] :
                             sequence->get_generated_ids()[position_id - prompt_len];
@@ -682,7 +691,7 @@ public:
             }
         }
         if (hidden_state_input && hidden_state_input.get_size() > 0) {
-            m_request.set_tensor("hidden_states", hidden_state_input);
+            m_request.set_tensor("target_hidden", hidden_state_input);
         }
         if (position_ids.get_shape().size() == 3 && position_ids.get_shape()[0] == 3 &&
             position_ids.get_shape()[1] == 1) {

@@ -47,7 +47,7 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(con
                                    allow_xattention).run_on_model(draft_model);
 
     utils::apply_gather_before_matmul_transformation(main_model);
-    utils::apply_gather_before_matmul_transformation(draft_model);
+    //utils::apply_gather_before_matmul_transformation(draft_model);
 
     bool is_draft_scheduler_undefined = draft_model_desc.scheduler_config == SchedulerConfig();
 

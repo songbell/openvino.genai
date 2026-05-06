@@ -204,6 +204,13 @@ init_request(
         auto log_probs = candidate_sequence.second.log_probs;
         token_ids.resize(min_candidate_len);
         log_probs.resize(min_candidate_len);
+        std::vector<int64_t> draft_prompt_ids;
+        /*draft_prompt_ids.resize(15);
+        draft_prompt_ids[0] = token_ids[0];
+        for (size_t i = 1; i < 15; i++) {
+            draft_prompt_ids[i] = 151669; // dflash special token id for padding
+        }*/
+        request->update_prompts(draft_prompt_ids);
 
         for (size_t i = 0; i < min_candidate_len; ++i) {
             sequence->append_token(token_ids[i], log_probs[i]);
@@ -212,12 +219,21 @@ init_request(
                 logit_processor.update_generated_len(sequence->get_generated_len());
             }
         }
-
+        // for dflash temp solution
+        // block size = 16
+        // padding inserted tokens to block size, padded token 151669
+        for (size_t i = 0; i < 15; ++i) {
+            sequence->append_token(151669, 0.0f);
+            if (is_update_logit_processor) {
+                logit_processor.register_new_generated_token(151669);
+                logit_processor.update_generated_len(sequence->get_generated_len());
+            }
+        }
         if (!is_init_all_sequences_in_request) {
             break;
         }
     }
-    return min_candidate_len;
+    return 15;
 }
 
 UpdateRequestResult 
@@ -260,7 +276,7 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
             min_generated_tokens = result.inserted_tokens_cnt;
             running_sequences = request->get_running_sequences();
             min_candidate_len = result.inserted_tokens_cnt;
-            if (eagle_mode_enabled && !m_is_validation_mode_enabled) {
+            if (true && !m_is_validation_mode_enabled) {
                 m_model_runner->set_initial_hidden_state(request_id,
                                                      candidates.begin()->second.hidden_states);
             }

@@ -68,6 +68,8 @@ std::vector<EncodedGenerationResult> generate_common(
                                     main_cfg, draft_cfg,
                                     main_in, draft_in);
             main_generations.push_back(self->main_pipeline()->add_request(rid, main_in, main_cfg));
+            draft_cfg.ignore_eos = true;
+            draft_cfg.stop_strings = {};
             self->m_draft_generations.insert({rid,
                 self->draft_pipeline()->add_request(rid, draft_in, draft_cfg)});
         }

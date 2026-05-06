@@ -13,6 +13,7 @@
 #include "openvino/op/gather.hpp"
 #include "openvino/op/matmul.hpp"
 #include "openvino/op/multiply.hpp"
+#include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
 #include "utils.hpp"
 
@@ -172,7 +173,7 @@ void move_fc_from_draft_to_main(std::shared_ptr<ov::Model>& draft_model, std::sh
             if (!matmul_node) continue;
             auto input_node = matmul_node->get_input_node_shared_ptr(0);
             auto param_node = ov::as_type_ptr<ov::op::v0::Parameter>(input_node);
-            if (!param_node || input_node->get_friendly_name().find("hidden_states") == std::string::npos) continue;
+            if (!param_node || (input_node->get_friendly_name().find("hidden_states") == std::string::npos && input_node->get_friendly_name().find("target_hidden") == std::string::npos)) continue;
             // Rewire all outputs of this MatMul to use the input_node directly
             for (auto& output : matmul_node->outputs()) {
                 for (auto& target : output.get_target_inputs()) {
@@ -227,7 +228,7 @@ void transform_hidden_state(std::shared_ptr<ov::Model>& model, const std::vector
         return;
     }
     OPENVINO_ASSERT(
-        hidden_layers_to_abstract.size() == 3 || hidden_layers_to_abstract.size() == 1,
+        hidden_layers_to_abstract.size() == 3 || hidden_layers_to_abstract.size() == 1 || hidden_layers_to_abstract.size() == 5,
         "Expected exactly 1 or 3 hidden layers for extraction: 1 for draft model, 3 for main model (early/middle/late stages)."
     );
 
@@ -299,6 +300,190 @@ ov::Tensor slice_hidden_state_for_last_token(const ov::Tensor& hidden_features) 
 }
 
 }  // namespace eagle3
+namespace dflash {
+// read from local config, to 
+DFlashRTInfo extract_dflash_info_from_config(const std::filesystem::path& config) {
+    DFlashRTInfo dflash_rt_info;
+    // check if config is exist, if not return default dflash_rt_info with empty hidden_layers_list and mask_token_id = -1
+    if (!config.empty() && std::filesystem::exists(config)) {
+        std::ifstream file(config);
+        nlohmann::json data = nlohmann::json::parse(file);
+        using ov::genai::utils::read_json_param;
+        /*  sample of dflash config:
+        "dflash_config": {
+            "mask_token_id": 151669,
+            "target_layer_ids": [
+            1,
+            9,
+            17,
+            25,
+            33
+            ]
+        },*/
+        read_json_param(data, "dflash_config.mask_token_id", dflash_rt_info.mask_token_id);
+        read_json_param(data, "dflash_config.target_layer_ids", dflash_rt_info.hidden_layers_list);
+    }
+
+    return dflash_rt_info;
+}
+
+void share_lm_head_weights(const std::shared_ptr<ov::Model>& main_model, const std::shared_ptr<ov::Model>& draft_model) {
+    // Extract lm_head weight producer from model.
+    // Prefer MatMul-based topology (e.g. __module.lm_head/aten::linear/MatMul),
+    // keep Gather as fallback for other model variants.
+    auto find_lm_head_weight = [](const std::shared_ptr<ov::Model>& model)
+        -> std::shared_ptr<ov::Node> {
+        for (const auto& node : model->get_ordered_ops()) {
+            auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
+            if (matmul && matmul->get_friendly_name().find("lm_head") != std::string::npos) {
+                return matmul->input_value(1).get_node_shared_ptr();
+            }
+
+            auto gather = ov::as_type_ptr<ov::op::util::GatherBase>(node);
+            if (!gather)
+                continue;
+            auto data_node = gather->input_value(0).get_node_shared_ptr();
+            if (data_node && data_node->get_friendly_name().find("lm_head") != std::string::npos) {
+                return data_node;
+            }
+        }
+        return nullptr;
+    };
+    auto main_weight_node = find_lm_head_weight(main_model);
+    auto draft_weight_node = find_lm_head_weight(draft_model);
+    if (!main_weight_node || !draft_weight_node) {
+        return;
+    }
+
+    if (main_weight_node.get() == draft_weight_node.get()) {
+        return;
+    }
+
+    GENAI_INFO("Copying LM head weights from main to draft model for D-Flash speculative decoding.");
+
+    // Clone the full producer path (including quantization/dequantization ops),
+    // not only the terminal Constant node.
+    std::function<std::shared_ptr<ov::Node>(const std::shared_ptr<ov::Node>&,
+                                            std::unordered_map<ov::Node*, std::shared_ptr<ov::Node>>&)> 
+        clone_node_recursive =
+            [&](const std::shared_ptr<ov::Node>& node,
+                std::unordered_map<ov::Node*, std::shared_ptr<ov::Node>>& cloned_nodes) -> std::shared_ptr<ov::Node> {
+
+        auto it = cloned_nodes.find(node.get());
+        if (it != cloned_nodes.end()) {
+            return it->second;
+        }
+
+        std::shared_ptr<ov::Node> cloned;
+        if (auto constant = ov::as_type_ptr<ov::op::v0::Constant>(node)) {
+            cloned = std::make_shared<ov::op::v0::Constant>(constant->get_element_type(),
+                                                            constant->get_shape(),
+                                                            constant->get_data_ptr());
+        } else {
+            ov::OutputVector cloned_inputs;
+            for (size_t i = 0; i < node->get_input_size(); ++i) {
+                auto input_node = node->get_input_node_shared_ptr(i);
+                auto cloned_input = clone_node_recursive(input_node, cloned_nodes);
+                cloned_inputs.push_back(cloned_input->output(node->get_input_source_output(i).get_index()));
+            }
+            cloned = node->clone_with_new_inputs(cloned_inputs);
+        }
+
+        cloned->set_friendly_name(node->get_friendly_name() + "_cloned_for_draft");
+        cloned_nodes[node.get()] = cloned;
+        return cloned;
+    };
+
+    std::unordered_map<ov::Node*, std::shared_ptr<ov::Node>> cloned_nodes;
+    auto cloned_weight_node = clone_node_recursive(main_weight_node, cloned_nodes);
+    OPENVINO_ASSERT(cloned_weight_node,
+                    "Failed to clone LM head weight node path from main model to draft model.");
+
+    draft_weight_node->output(0).replace(cloned_weight_node->output(0));
+}
+
+void normalize_draft_kvproj_concat_axis(std::shared_ptr<ov::Model>& draft_model) {
+    size_t updated_concat_count = 0;
+    size_t updated_reshape_count = 0;
+    for (const auto& node : draft_model->get_ordered_ops()) {
+        auto concat = ov::as_type_ptr<ov::op::v0::Concat>(node);
+        if (!concat)
+            continue;
+
+        const auto& name = concat->get_friendly_name();
+        if (name.find("self_attn/aten::cat") == std::string::npos)
+            continue;
+
+        // Only rewrite problematic k_proj/v_proj concat path: both inputs are MatMul and
+        // concat is authored along sequence axis (1) for non-flattened [B, S, H].
+        // With flattened [B*S, 1, H], runtime concatenation should happen on axis 0.
+        if (concat->get_input_size() != 2 || concat->get_axis() != 1)
+            continue;
+
+        auto lhs = ov::as_type_ptr<ov::op::v0::MatMul>(concat->get_input_node_shared_ptr(0));
+        auto rhs = ov::as_type_ptr<ov::op::v0::MatMul>(concat->get_input_node_shared_ptr(1));
+        if (!lhs || !rhs)
+            continue;
+
+        const auto& lhs_name = lhs->get_friendly_name();
+        const auto& rhs_name = rhs->get_friendly_name();
+        const bool is_kv_proj_pair =
+            ((lhs_name.find("self_attn.k_proj/") != std::string::npos && rhs_name.find("self_attn.k_proj/") != std::string::npos) ||
+             (lhs_name.find("self_attn.v_proj/") != std::string::npos && rhs_name.find("self_attn.v_proj/") != std::string::npos));
+        if (!is_kv_proj_pair)
+            continue;
+
+        concat->set_axis(0);
+
+        // Keep downstream reshape math consistent with flattened [B*S, 1, H] semantics.
+        // Original shape formulas are built for axis=1 concatenation over [B, S, H].
+        for (const auto& target_input : concat->output(0).get_target_inputs()) {
+            if (target_input.get_index() != 0)
+                continue;
+
+            auto reshape = ov::as_type_ptr<ov::op::v1::Reshape>(target_input.get_node()->shared_from_this());
+            if (!reshape)
+                continue;
+
+            auto concat_ps = concat->get_output_partial_shape(0);
+            auto reshape_ps = reshape->get_output_partial_shape(0);
+            if (concat_ps.rank().is_dynamic() || reshape_ps.rank().is_dynamic() ||
+                concat_ps.rank().get_length() != 3 || reshape_ps.rank().get_length() != 4 ||
+                !concat_ps[2].is_static() || !reshape_ps[3].is_static()) {
+                continue;
+            }
+
+            const int64_t hidden = concat_ps[2].get_length();
+            const int64_t head_size = reshape_ps[3].get_length();
+            if (head_size <= 0 || hidden <= 0 || (hidden % head_size != 0))
+                continue;
+
+            const int64_t num_heads = hidden / head_size;
+            auto concat_shape = std::make_shared<ov::op::v3::ShapeOf>(concat);
+            auto axis0 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+            auto idx0 = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+            auto tokens = std::make_shared<ov::op::v8::Gather>(concat_shape, idx0, axis0);
+            auto one = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+            auto nh = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {num_heads});
+            auto hs = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {head_size});
+            auto new_shape = std::make_shared<ov::op::v0::Concat>(ov::OutputVector{tokens, one, nh, hs}, 0);
+            reshape->input(1).replace_source_output(new_shape);
+            updated_reshape_count++;
+        }
+
+        updated_concat_count++;
+    }
+
+    if (updated_concat_count > 0) {
+        GENAI_INFO(
+            "Adjusted {} draft self-attn k_proj/v_proj Concat node(s) axis from 1 to 0 and updated {} dependent Reshape node(s).",
+            updated_concat_count,
+            updated_reshape_count);
+        draft_model->validate_nodes_and_infer_types();
+    }
+}
+
+}  // namespace dflash
 }  // namespace utils
 }  // namespace genai
 }  // namespace ov

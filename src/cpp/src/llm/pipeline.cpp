@@ -292,6 +292,7 @@ ov::genai::LLMPipeline::LLMPipeline(
 #endif
         } catch (ov::Exception&) {
             // ignore exceptions from PA
+            OPENVINO_THROW("error");
         }
     }
 

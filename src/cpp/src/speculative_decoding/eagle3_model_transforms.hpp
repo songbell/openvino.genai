@@ -104,6 +104,27 @@ void transform_hidden_state(std::shared_ptr<ov::Model>& model, const std::vector
 ov::Tensor slice_hidden_state_for_last_token(const ov::Tensor& hidden_features);
 
 }  // namespace eagle3
+namespace dflash {
+struct DFlashRTInfo {
+    std::vector<int32_t> hidden_layers_list;  ///< Indices of layers to extract hidden states from
+    int64_t mask_token_id = -1;                    ///< Mask token ID for D-Flash decoding
+};
+
+/**
+ * @brief Extracts DFLASH configuration from model config.
+ * @param config Model configuration map.
+ * @return DFlashRTInfo structure with extracted configuration.
+ */
+DFlashRTInfo extract_dflash_info_from_config(const std::filesystem::path& config_path = {});
+
+void share_lm_head_weights(const std::shared_ptr<ov::Model>& main_model, const std::shared_ptr<ov::Model>& draft_model);
+
+// In D-Flash continuous batching, some draft exports use flattened [B*S, 1, H] K/V paths
+// while Concat is still authored for [B, S, H] (axis=1). This helper rewrites only the
+// affected self-attn k_proj/v_proj MatMul concat nodes to axis=0 and updates following
+// Reshape shape-input formulas accordingly.
+void normalize_draft_kvproj_concat_axis(std::shared_ptr<ov::Model>& draft_model);
+}  // namespace dflash
 }  // namespace utils
 }  // namespace genai
 }  // namespace ov

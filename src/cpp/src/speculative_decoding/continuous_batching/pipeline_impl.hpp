@@ -123,4 +123,27 @@ public:
         }
     }
 };
+class ContinuousBatchingPipeline::ContinuousBatchingForDFlashDecodingImpl
+    : public ContinuousBatchingPipeline::ContinuousBatchingForEagle3DecodingImpl {
+public:
+    ContinuousBatchingForDFlashDecodingImpl() = default;
+
+    ContinuousBatchingForDFlashDecodingImpl(const std::shared_ptr<ov::Model>& model,
+                                            const Tokenizer& tokenizer,
+                                            const GenerationConfig& generation_config,
+                                            const SchedulerConfig& scheduler_config,
+                                            const std::string& device,
+                                            const ov::AnyMap& plugin_config,
+                                            bool is_validation_mode_enabled,
+                                            const std::shared_ptr<ov::Model>& kv_update_model = nullptr)
+        : ContinuousBatchingForEagle3DecodingImpl(model,
+                                                       tokenizer,
+                                                       generation_config,
+                                                       scheduler_config,
+                                                       device,
+                                                       plugin_config,
+                                                       is_validation_mode_enabled) {
+        eagle_mode_enabled = false;
+    };
+};
 }
