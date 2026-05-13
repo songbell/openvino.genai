@@ -11,7 +11,7 @@ namespace ov::genai {
 class ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl : public ContinuousBatchingPipeline::ContinuousBatchingImpl {
 public:
     const std::size_t default_num_assistant_tokens = 5;
- 
+
     ContinuousBatchingForSpeculativeDecodingImpl() = default;
 
     ContinuousBatchingForSpeculativeDecodingImpl(const std::shared_ptr<ov::Model>& model,
@@ -26,13 +26,36 @@ public:
 
     void finish_request(int64_t request_id = -1);
     void pull_awaiting_requests(bool is_pause_request = false);
+    void pause_requests();
     GeneratedRequests get_generated_requests();
     UpdateRequestResult update_request(uint64_t request_id, const GeneratedSequences& candidates, bool is_update_logit_processor);
     bool is_requests_empty();
 
     size_t get_processed_tokens_per_iteration();
 
+    size_t get_total_num_processed_tokens() const {
+        size_t total = 0;
+        for (const auto& request : m_requests) {
+            total += request->get_num_processed_tokens();
+        }
+        return total;
+    }
+
     UpdateRequestResult init_request_by_candidate(uint64_t request_id, const GeneratedSequences& candidates);
+
+    /**
+     * @brief Schedule-only step for virtual prefill in speculative decoding
+     *
+     * Performs only the scheduling part (KV cache block allocation) without
+     * running forward pass or sampling. This is used for draft model's virtual
+     * prefill to ensure KV cache blocks are properly allocated in paged attention
+     * before actual token generation.
+     *
+     * @note This is specifically designed for paged attention backends where
+     *       KV cache blocks must be pre-allocated before generation.
+     *       After calling this, the pipeline is ready for multistep() generation.
+     */
+    void schedule_only_step();
 
     RawPerfMetrics raw_perf_metrics;
 

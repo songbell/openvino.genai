@@ -15,6 +15,10 @@
 #include "openvino/op/multiply.hpp"
 #include "openvino/op/reshape.hpp"
 #include "openvino/op/result.hpp"
+#include "openvino/op/scaled_dot_product_attention.hpp"
+#include "openvino/op/scatter_update.hpp"
+#include "openvino/op/shape_of.hpp"
+#include "openvino/op/unsqueeze.hpp"
 #include "utils.hpp"
 
 namespace ov {
@@ -299,6 +303,113 @@ ov::Tensor slice_hidden_state_for_last_token(const ov::Tensor& hidden_features) 
     return ov::Tensor(hidden_features, start_coord, end_coord);
 }
 
+std::shared_ptr<ov::Model> construct_eagle3_kv_update_model(const std::shared_ptr<ov::Model>& main_model) {
+    // the kv update model acceptes all kv cache inputs from main_model
+    // extra inputs for updating kv cache: block_indices, block_indices_begins, block_update_indices, block_update_indices_begins， all with element::i32, PartialShape{-1}
+    // the output is the updated kv cache with same shape and element type as main model's kv cache
+    auto kv_update_model = std::make_shared<ov::Model>(main_model->get_results(), main_model->get_parameters(), "eagle3_kv_update_model");
+    using namespace ov;
+    ParameterVector inputs;
+    // clone the kv cache parameters from the main model
+    auto params = main_model->get_parameters();
+    std::vector<Output<Node>> key_caches;
+    std::vector<Output<Node>> value_caches;
+    for (const auto& param : params) {
+        const std::string& name = param->get_friendly_name();
+        // Find paged_attention op connected to this param
+        std::shared_ptr<ov::Node> paged_attention_op = nullptr;
+        for (const auto& node : main_model->get_ordered_ops()) {
+            // Typical paged_attention op is custom, so check op type and input
+            if (node->get_friendly_name().find("PagedAttentionExtension") != std::string::npos) {
+                for (size_t idx = 0; idx < node->get_input_size(); ++idx) {
+                    if (node->get_input_node_shared_ptr(idx).get() == param.get()) {
+                        paged_attention_op = node;
+                        break;
+                    }
+                }
+                if (paged_attention_op) break;
+            }
+        }
+        if (name.find("key_cache") != std::string::npos) {
+            auto cloned_param = std::make_shared<ov::op::v0::Parameter>(param->get_element_type(), param->get_partial_shape());
+            cloned_param->set_friendly_name(name);
+            cloned_param->output(0).set_names({name});
+            // Clone runtime info from paged_attention op if found
+            if (paged_attention_op) {
+                for (const auto& [key, value] : paged_attention_op->get_rt_info()) {
+                    cloned_param->get_rt_info()[key] = value;
+                }
+            }
+            inputs.push_back(cloned_param);
+            key_caches.push_back(cloned_param);
+        } else if (name.find("value_cache") != std::string::npos) {
+            auto cloned_param = std::make_shared<ov::op::v0::Parameter>(param->get_element_type(), param->get_partial_shape());
+            cloned_param->set_friendly_name(name);
+            cloned_param->output(0).set_names({name});
+            // Clone runtime info from paged_attention op if found
+            if (paged_attention_op) {
+                for (const auto& [key, value] : paged_attention_op->get_rt_info()) {
+                    cloned_param->get_rt_info()[key] = value;
+                }
+            }
+            inputs.push_back(cloned_param);
+            value_caches.push_back(cloned_param);
+        }
+    }
+
+    auto block_indices_begins = std::make_shared<op::v0::Parameter>(
+        element::i32, PartialShape{-1});
+    block_indices_begins->set_friendly_name("block_indices_begins");
+    block_indices_begins->output(0).set_names({"block_indices_begins"});
+    inputs.push_back(block_indices_begins);
+
+    auto block_indices = std::make_shared<op::v0::Parameter>(
+        element::i32, PartialShape{-1});
+    block_indices->set_friendly_name("block_indices");
+    block_indices->output(0).set_names({"block_indices"});
+    inputs.push_back(block_indices);
+
+    auto block_update_indices = std::make_shared<op::v0::Parameter>(
+        element::i32, PartialShape{-1});
+    block_update_indices->set_friendly_name("block_update_indices");
+    block_update_indices->output(0).set_names({"block_update_indices"});
+    inputs.push_back(block_update_indices);
+
+    auto block_update_indices_begins = std::make_shared<op::v0::Parameter>(
+        element::i32, PartialShape{-1});
+    block_update_indices_begins->set_friendly_name("block_update_indices_begins");
+    block_update_indices_begins->output(0).set_names({"block_update_indices_begins"});
+    inputs.push_back(block_update_indices_begins);
+
+    ResultVector results;
+    size_t pair_count = std::min(key_caches.size(), value_caches.size());
+    for (size_t i = 0; i < pair_count; ++i) {
+        auto key_gather = std::make_shared<op::v8::Gather>(
+            key_caches[i], block_update_indices, std::make_shared<op::v0::Constant>(element::i32, ov::Shape{1}, -1));
+        key_gather->set_friendly_name("reordered_key_cache_" + std::to_string(i));
+        auto key_scatter = std::make_shared<op::v3::ScatterUpdate>(
+            key_caches[i], block_indices, key_gather, std::make_shared<op::v0::Constant>(element::i32, ov::Shape{1}, -1));
+        key_scatter->set_friendly_name("updated_key_cache_" + std::to_string(i));
+
+        auto value_gather = std::make_shared<op::v8::Gather>(
+            value_caches[i], block_update_indices, std::make_shared<op::v0::Constant>(element::i32, ov::Shape{1}, -2));
+        value_gather->set_friendly_name("reordered_value_cache_" + std::to_string(i));
+        auto value_scatter = std::make_shared<op::v3::ScatterUpdate>(
+            value_caches[i], block_indices, value_gather, std::make_shared<op::v0::Constant>(element::i32, ov::Shape{1}, -2));
+        value_scatter->set_friendly_name("updated_value_cache_" + std::to_string(i));
+
+        // Concat key and value scatter outputs along last axis
+        auto concat = std::make_shared<ov::op::v0::Concat>(
+            ov::OutputVector{key_scatter->output(0), value_scatter->output(0)}, -1);
+        concat->set_friendly_name("kv_cache_pair_concat_" + std::to_string(i));
+        results.push_back(std::make_shared<op::v0::Result>(concat));
+    }
+
+    auto model = std::make_shared<Model>(results, inputs, "kv_cache_reorder_model");
+    // addition runtime info for identification
+    model->get_rt_info()["auxiliary_kv_update_model"] = true;
+    return model;
+}
 }  // namespace eagle3
 namespace dflash {
 // read from local config, to 
@@ -420,8 +531,24 @@ void normalize_draft_kvproj_concat_axis(std::shared_ptr<ov::Model>& draft_model)
         if (concat->get_input_size() != 2 || concat->get_axis() != 1)
             continue;
 
-        auto lhs = ov::as_type_ptr<ov::op::v0::MatMul>(concat->get_input_node_shared_ptr(0));
-        auto rhs = ov::as_type_ptr<ov::op::v0::MatMul>(concat->get_input_node_shared_ptr(1));
+        // Try to get MatMul nodes, possibly through Reshape
+        auto get_matmul = [](const std::shared_ptr<ov::Node>& node) -> std::shared_ptr<ov::op::v0::MatMul> {
+            // First try direct MatMul
+            auto matmul = ov::as_type_ptr<ov::op::v0::MatMul>(node);
+            if (matmul)
+                return matmul;
+
+            // If not, try through Reshape
+            auto reshape = ov::as_type_ptr<ov::op::v1::Reshape>(node);
+            if (reshape) {
+                return ov::as_type_ptr<ov::op::v0::MatMul>(reshape->get_input_node_shared_ptr(0));
+            }
+
+            return nullptr;
+        };
+
+        auto lhs = get_matmul(concat->get_input_node_shared_ptr(0));
+        auto rhs = get_matmul(concat->get_input_node_shared_ptr(1));
         if (!lhs || !rhs)
             continue;
 
@@ -484,6 +611,508 @@ void normalize_draft_kvproj_concat_axis(std::shared_ptr<ov::Model>& draft_model)
 }
 
 }  // namespace dflash
+
+void change_draft_sdpa(std::shared_ptr<ov::Model>& draft_model) {
+    using namespace ov::op;
+
+    size_t modified_sdpa_count = 0;
+    size_t removed_reshape_count = 0;
+    size_t removed_unsqueeze_count = 0;
+
+    // Iterate through all nodes to find ScaledDotProductAttention operations
+    for (const auto& node : draft_model->get_ops()) {
+        auto sdpa = std::dynamic_pointer_cast<v13::ScaledDotProductAttention>(node);
+        if (!sdpa) {
+            continue;
+        }
+
+        // Input 0: query - remove Reshape if exists
+        // Input 1: key - remove Unsqueeze if exists
+        // Input 2: value - remove Unsqueeze if exists
+
+        bool modified = false;
+
+        // Handle input 0 (query) - remove Reshape
+        if (sdpa->get_input_size() > 0) {
+            auto query_source = sdpa->input_value(0);
+            auto reshape_node = std::dynamic_pointer_cast<v1::Reshape>(query_source.get_node_shared_ptr());
+
+            if (reshape_node) {
+                // Replace SDPA's query input with Reshape's input
+                auto reshape_input = reshape_node->input_value(0);
+                sdpa->input(0).replace_source_output(reshape_input);
+                removed_reshape_count++;
+                modified = true;
+            }
+        }
+
+        // Handle input 1 (key) - remove Unsqueeze
+        if (sdpa->get_input_size() > 1) {
+            auto key_source = sdpa->input_value(1);
+            auto unsqueeze_node = std::dynamic_pointer_cast<v0::Unsqueeze>(key_source.get_node_shared_ptr());
+
+            if (unsqueeze_node) {
+                // Replace SDPA's key input with Unsqueeze's input
+                auto unsqueeze_input = unsqueeze_node->input_value(0);
+                sdpa->input(1).replace_source_output(unsqueeze_input);
+                removed_unsqueeze_count++;
+                modified = true;
+            }
+        }
+
+        // Handle input 2 (value) - remove Unsqueeze
+        if (sdpa->get_input_size() > 2) {
+            auto value_source = sdpa->input_value(2);
+            auto unsqueeze_node = std::dynamic_pointer_cast<v0::Unsqueeze>(value_source.get_node_shared_ptr());
+
+            if (unsqueeze_node) {
+                // Replace SDPA's value input with Unsqueeze's input
+                auto unsqueeze_input = unsqueeze_node->input_value(0);
+                sdpa->input(2).replace_source_output(unsqueeze_input);
+                removed_unsqueeze_count++;
+                modified = true;
+            }
+        }
+
+        if (modified) {
+            modified_sdpa_count++;
+        }
+    }
+
+    if (modified_sdpa_count > 0) {
+        GENAI_INFO(
+            "Modified {} SDPA node(s) in draft model: removed {} Reshape and {} Unsqueeze node(s).",
+            modified_sdpa_count,
+            removed_reshape_count,
+            removed_unsqueeze_count);
+        draft_model->validate_nodes_and_infer_types();
+    }
+}
+
+void update_positional_encoding_to_relative(std::shared_ptr<ov::Model>& draft_model) {
+    using namespace ov::op;
+
+    // Step 1: Find the two Multiply nodes
+    std::shared_ptr<ov::Node> hidden_norm_multiply = nullptr;
+    std::shared_ptr<ov::Node> input_layernorm_multiply = nullptr;
+
+    for (const auto& node : draft_model->get_ops()) {
+        const auto& name = node->get_friendly_name();
+
+        if (name.find("__module.model.hidden_norm/aten::mul/Multiply_1") != std::string::npos) {
+            hidden_norm_multiply = node;
+        } else if (name.find("__module.model.layers.0.input_layernorm/aten::mul/Multiply_1") != std::string::npos) {
+            input_layernorm_multiply = node;
+        }
+    }
+
+    if (!hidden_norm_multiply || !input_layernorm_multiply) {
+        GENAI_INFO("update_positional_encoding_to_relative: Required Multiply nodes not found");
+        return;
+    }
+
+    // Step 2: Create Concat node combining the two outputs
+    // Concat along axis 1 (seq_len dimension)
+    auto concat_node = std::make_shared<v0::Concat>(
+        ov::OutputVector{hidden_norm_multiply->output(0), input_layernorm_multiply->output(0)},
+        0  // axis = 1
+    );
+    concat_node->set_friendly_name("positional_encoding_concat");
+
+    // Step 3: Find the rotary_emb MatMul node
+    std::shared_ptr<v0::MatMul> rotary_matmul = nullptr;
+    for (const auto& node : draft_model->get_ops()) {
+        const auto& name = node->get_friendly_name();
+        if (name.find("__module.model.rotary_emb/aten::matmul/MatMul") != std::string::npos) {
+            rotary_matmul = std::dynamic_pointer_cast<v0::MatMul>(node);
+            if (rotary_matmul) {
+                break;
+            }
+        }
+    }
+
+    if (!rotary_matmul) {
+        GENAI_INFO("update_positional_encoding_to_relative: rotary_emb MatMul not found");
+        return;
+    }
+
+    // Step 4: Recursively traverse up from MatMul to find ShapeOf node
+    std::function<std::shared_ptr<v3::ShapeOf>(std::shared_ptr<ov::Node>)> find_shapeof =
+    [&](std::shared_ptr<ov::Node> current) -> std::shared_ptr<v3::ShapeOf> {
+        // Check if current node is ShapeOf
+        auto shapeof = std::dynamic_pointer_cast<v3::ShapeOf>(current);
+        if (shapeof) {
+            return shapeof;
+        }
+
+        // Recursively search up the chain through all inputs
+        for (size_t i = 0; i < current->get_input_size(); i++) {
+            auto input_node = current->get_input_node_shared_ptr(i);
+            auto found = find_shapeof(input_node);
+            if (found) {
+                return found;
+            }
+        }
+        return nullptr;
+    };
+
+    auto old_shapeof_node = find_shapeof(rotary_matmul);
+
+    if (old_shapeof_node) {
+        // Create a new ShapeOf node connected to concat
+        auto new_shapeof = std::make_shared<v3::ShapeOf>(concat_node->output(0), old_shapeof_node->get_output_element_type(0));
+        new_shapeof->set_friendly_name("positional_encoding_shapeof");
+
+        // Replace all usages of old_shapeof that are in the MatMul chain
+        // We need to find which consumer of old_shapeof leads to rotary_matmul
+        for (auto& target_input : old_shapeof_node->output(0).get_target_inputs()) {
+            auto consumer = target_input.get_node()->shared_from_this();
+
+            // Check if this consumer is in the path to rotary_matmul
+            std::unordered_set<ov::Node*> visited;
+            std::function<bool(std::shared_ptr<ov::Node>)> is_in_matmul_chain =
+            [&](std::shared_ptr<ov::Node> node) -> bool {
+                if (node == rotary_matmul) {
+                    return true;
+                }
+
+                // Avoid infinite recursion
+                if (visited.count(node.get()) > 0) {
+                    return false;
+                }
+                visited.insert(node.get());
+
+                // Check all consumers of this node
+                for (auto& out_input : node->output(0).get_target_inputs()) {
+                    if (is_in_matmul_chain(out_input.get_node()->shared_from_this())) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            if (is_in_matmul_chain(consumer)) {
+                // Replace this usage with new ShapeOf
+                target_input.replace_source_output(new_shapeof->output(0));
+                GENAI_INFO("update_positional_encoding_to_relative: Replaced ShapeOf usage in '{}' with new concat-based ShapeOf",
+                          consumer->get_friendly_name());
+            }
+        }
+
+        draft_model->validate_nodes_and_infer_types();
+        return;
+    }
+
+    GENAI_INFO("update_positional_encoding_to_relative: Could not find ShapeOf node in chain");
+}
+
+void update_slice_axis_update(std::shared_ptr<ov::Model>& draft_model) {
+    using namespace ov::op;
+
+    // Step 1: Find the Subtract node
+    std::shared_ptr<ov::Node> subtract_node = nullptr;
+    for (const auto& node : draft_model->get_ops()) {
+        const auto& name = node->get_friendly_name();
+        if (name.find("__module.model.layers.0.self_attn/aten::sub/Subtract") != std::string::npos) {
+            subtract_node = node;
+            break;
+        }
+    }
+
+    if (!subtract_node) {
+        std::cout << "update_slice_axis_update: Subtract node not found" << std::endl;
+        return;
+    }
+
+    std::cout << "update_slice_axis_update: Found Subtract node: " << subtract_node->get_friendly_name() << std::endl;
+
+    // Step 2: Find the two Gather inputs
+    std::vector<std::shared_ptr<ov::op::v8::Gather>> gather_nodes;
+
+    for (size_t i = 0; i < subtract_node->get_input_size(); i++) {
+        auto input_node = subtract_node->get_input_node_shared_ptr(i);
+
+        // Try to find Gather node (might be direct or through intermediate nodes)
+        std::function<std::shared_ptr<v8::Gather>(std::shared_ptr<ov::Node>, int)> find_gather;
+        find_gather = [&](std::shared_ptr<ov::Node> node, int depth) -> std::shared_ptr<v8::Gather> {
+            if (depth > 5) return nullptr; // Limit search depth
+
+            auto gather = std::dynamic_pointer_cast<v8::Gather>(node);
+            if (gather) {
+                return gather;
+            }
+
+            // Search through inputs
+            for (size_t j = 0; j < node->get_input_size(); j++) {
+                auto result = find_gather(node->get_input_node_shared_ptr(j), depth + 1);
+                if (result) return result;
+            }
+
+            return nullptr;
+        };
+
+        auto gather = find_gather(input_node, 0);
+        if (gather) {
+            gather_nodes.push_back(gather);
+        }
+    }
+
+    if (gather_nodes.empty()) {
+        std::cout << "update_slice_axis_update: No Gather nodes found in Subtract inputs" << std::endl;
+        return;
+    }
+
+    std::cout << "update_slice_axis_update: Found " << gather_nodes.size() << " Gather node(s)" << std::endl;
+
+    // Step 3: Dump Gather indices and axis values, then modify them
+    size_t modified_count = 0;
+    for (size_t i = 0; i < gather_nodes.size(); i++) {
+        auto gather = gather_nodes[i];
+        std::cout << "  Gather " << i << ": " << gather->get_friendly_name() << std::endl;
+
+        // Get current axis
+        int64_t old_axis = 0;
+        if (gather->get_input_size() > 2) {
+            auto axis_node = std::dynamic_pointer_cast<v0::Constant>(gather->get_input_node_shared_ptr(2));
+            if (axis_node) {
+                auto axis_data = axis_node->cast_vector<int64_t>();
+                old_axis = axis_data.empty() ? 0 : axis_data[0];
+                std::cout << "    Old Axis: " << old_axis << std::endl;
+            } else {
+                std::cout << "    Axis: dynamic (not constant)" << std::endl;
+            }
+        }
+
+        // Get current indices
+        auto indices_node = std::dynamic_pointer_cast<v0::Constant>(gather->get_input_node_shared_ptr(1));
+        if (indices_node) {
+            auto indices_shape = indices_node->get_shape();
+            std::cout << "    Indices shape: [";
+            for (size_t j = 0; j < indices_shape.size(); j++) {
+                if (j > 0) std::cout << ", ";
+                std::cout << indices_shape[j];
+            }
+            std::cout << "]" << std::endl;
+
+            // Try to get indices values (limit output)
+            if (indices_node->get_element_type() == ov::element::i64) {
+                auto indices_data = indices_node->cast_vector<int64_t>();
+                if (indices_data.size() <= 10) {
+                    std::cout << "    Old Indices values: [";
+                    for (size_t j = 0; j < indices_data.size(); j++) {
+                        if (j > 0) std::cout << ", ";
+                        std::cout << indices_data[j];
+                    }
+                    std::cout << "]" << std::endl;
+                } else {
+                    std::cout << "    Old Indices values: [" << indices_data[0] << "...] (total " << indices_data.size() << " elements)" << std::endl;
+                }
+            } else if (indices_node->get_element_type() == ov::element::i32) {
+                auto indices_data = indices_node->cast_vector<int32_t>();
+                if (indices_data.size() <= 10) {
+                    std::cout << "    Old Indices values: [";
+                    for (size_t j = 0; j < indices_data.size(); j++) {
+                        if (j > 0) std::cout << ", ";
+                        std::cout << indices_data[j];
+                    }
+                    std::cout << "]" << std::endl;
+                } else {
+                    std::cout << "    Old Indices values: [" << indices_data[0] << "...] (total " << indices_data.size() << " elements)" << std::endl;
+                }
+            }
+        } else {
+            std::cout << "    Indices: dynamic (not constant)" << std::endl;
+        }
+
+        // Get input data shape
+        std::cout << "    Input 0 shape: " << gather->get_input_partial_shape(0) << std::endl;
+        std::cout << "    Output shape: " << gather->get_output_partial_shape(0) << std::endl;
+
+        // Step 4: Modify indices and axis to 0
+        // Create new indices constant with value [0]
+        auto new_indices = v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+        new_indices->set_friendly_name(gather->get_friendly_name() + "_new_indices");
+
+        // Create new axis constant with value 0
+        auto new_axis = v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+        new_axis->set_friendly_name(gather->get_friendly_name() + "_new_axis");
+
+        // Replace Gather's inputs
+        gather->input(1).replace_source_output(new_indices->output(0));  // indices
+        if (gather->get_input_size() > 2) {
+            gather->input(2).replace_source_output(new_axis->output(0));  // axis
+        }
+
+        std::cout << "    Modified: indices=[0], axis=0" << std::endl;
+        modified_count++;
+    }
+
+    if (modified_count > 0) {
+        std::cout << "update_slice_axis_update: Modified " << modified_count << " Gather node(s)" << std::endl;
+        draft_model->validate_nodes_and_infer_types();
+    }
+}
+
+namespace {
+// Helper function to dump Slice node inputs
+void dump_slice_inputs(std::shared_ptr<ov::Node> slice_node, int slice_index) {
+    using namespace ov::op;
+
+    std::cout << "  Slice " << slice_index << " inputs:" << std::endl;
+    std::cout << "    Total inputs: " << slice_node->get_input_size() << std::endl;
+
+    // Slice typically has 3-5 inputs: data, start, stop, [step], [axes]
+    for (size_t i = 0; i < slice_node->get_input_size(); i++) {
+        std::string input_name;
+        switch (i) {
+            case 0: input_name = "data"; break;
+            case 1: input_name = "start"; break;
+            case 2: input_name = "stop"; break;
+            case 3: input_name = "step"; break;
+            case 4: input_name = "axes"; break;
+            default: input_name = "input_" + std::to_string(i); break;
+        }
+
+        std::cout << "    Input " << i << " (" << input_name << "):" << std::endl;
+
+        auto input_node = slice_node->get_input_node_shared_ptr(i);
+        std::cout << "      Node type: " << input_node->get_type_name() << std::endl;
+        std::cout << "      Shape: " << slice_node->get_input_partial_shape(i) << std::endl;
+
+        // Try to get constant value
+        auto constant_node = std::dynamic_pointer_cast<v0::Constant>(input_node);
+        if (constant_node) {
+            auto shape = constant_node->get_shape();
+            std::cout << "      Constant shape: [";
+            for (size_t j = 0; j < shape.size(); j++) {
+                if (j > 0) std::cout << ", ";
+                std::cout << shape[j];
+            }
+            std::cout << "]" << std::endl;
+
+            // Try to print values
+            if (constant_node->get_element_type() == ov::element::i64) {
+                auto values = constant_node->cast_vector<int64_t>();
+                if (values.size() <= 10) {
+                    std::cout << "      Values (i64): [";
+                    for (size_t j = 0; j < values.size(); j++) {
+                        if (j > 0) std::cout << ", ";
+                        std::cout << values[j];
+                    }
+                    std::cout << "]" << std::endl;
+                } else {
+                    std::cout << "      Values (i64): [" << values[0] << ", ...] (total " << values.size() << " elements)" << std::endl;
+                }
+            } else if (constant_node->get_element_type() == ov::element::i32) {
+                auto values = constant_node->cast_vector<int32_t>();
+                if (values.size() <= 10) {
+                    std::cout << "      Values (i32): [";
+                    for (size_t j = 0; j < values.size(); j++) {
+                        if (j > 0) std::cout << ", ";
+                        std::cout << values[j];
+                    }
+                    std::cout << "]" << std::endl;
+                } else {
+                    std::cout << "      Values (i32): [" << values[0] << ", ...] (total " << values.size() << " elements)" << std::endl;
+                }
+            }
+        } else {
+            std::cout << "      Dynamic (not constant)" << std::endl;
+        }
+    }
+
+    std::cout << "    Output shape: " << slice_node->get_output_partial_shape(0) << std::endl;
+}
+}  // anonymous namespace
+
+void update_strided_slice_axis_update(std::shared_ptr<ov::Model>& draft_model) {
+    using namespace ov::op;
+
+    // Step 1: Find the two Slice nodes
+    std::shared_ptr<ov::Node> slice_node = nullptr;
+    std::shared_ptr<ov::Node> slice_1_node = nullptr;
+
+    for (const auto& node : draft_model->get_ops()) {
+        const auto& name = node->get_friendly_name();
+
+        if (name.find("__module.model.layers.0.self_attn/aten::narrow/Slice") != std::string::npos) {
+            if (name.find("Slice_1") != std::string::npos) {
+                slice_1_node = node;
+            } else {
+                // Make sure it's the base Slice, not Slice_1
+                if (name.find("__module.model.layers.0.self_attn/aten::narrow/Slice") == name.rfind("__module.model.layers.0.self_attn/aten::narrow/Slice")) {
+                    slice_node = node;
+                }
+            }
+        }
+    }
+
+    std::vector<std::shared_ptr<ov::Node>> slice_nodes;
+    if (slice_node) {
+        slice_nodes.push_back(slice_node);
+        std::cout << "update_strided_slice_axis_update: Found Slice node: " << slice_node->get_friendly_name() << std::endl;
+        dump_slice_inputs(slice_node, 0);
+    } else {
+        std::cout << "update_strided_slice_axis_update: Slice node not found" << std::endl;
+    }
+
+    if (slice_1_node) {
+        slice_nodes.push_back(slice_1_node);
+        std::cout << "update_strided_slice_axis_update: Found Slice_1 node: " << slice_1_node->get_friendly_name() << std::endl;
+        dump_slice_inputs(slice_1_node, 1);
+    } else {
+        std::cout << "update_strided_slice_axis_update: Slice_1 node not found" << std::endl;
+    }
+
+    // Step 2: Modify axes to 0
+    size_t modified_count = 0;
+    for (auto& slice : slice_nodes) {
+        // Slice has input 4 as axes (if present)
+        if (slice->get_input_size() > 4) {
+            auto axes_node = slice->get_input_node_shared_ptr(4);
+            auto axes_constant = std::dynamic_pointer_cast<v0::Constant>(axes_node);
+
+            if (axes_constant) {
+                // Get old axes value
+                std::vector<int64_t> old_axes;
+                if (axes_constant->get_element_type() == ov::element::i64) {
+                    old_axes = axes_constant->cast_vector<int64_t>();
+                } else if (axes_constant->get_element_type() == ov::element::i32) {
+                    auto axes_i32 = axes_constant->cast_vector<int32_t>();
+                    old_axes.assign(axes_i32.begin(), axes_i32.end());
+                }
+
+                std::cout << "  Modifying " << slice->get_friendly_name() << std::endl;
+                std::cout << "    Old axes: [";
+                for (size_t i = 0; i < old_axes.size(); i++) {
+                    if (i > 0) std::cout << ", ";
+                    std::cout << old_axes[i];
+                }
+                std::cout << "]" << std::endl;
+
+                // Create new axes constant with value [0]
+                auto new_axes = v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+                new_axes->set_friendly_name(slice->get_friendly_name() + "_new_axes");
+
+                // Replace Slice's axes input
+                slice->input(4).replace_source_output(new_axes->output(0));
+
+                std::cout << "    New axes: [0]" << std::endl;
+                modified_count++;
+            } else {
+                std::cout << "  Warning: axes input is not a constant for " << slice->get_friendly_name() << std::endl;
+            }
+        } else {
+            std::cout << "  Warning: Slice node " << slice->get_friendly_name() << " has no axes input (input count: " << slice->get_input_size() << ")" << std::endl;
+        }
+    }
+
+    if (modified_count > 0) {
+        std::cout << "update_strided_slice_axis_update: Modified " << modified_count << " Slice node(s)" << std::endl;
+        draft_model->validate_nodes_and_infer_types();
+    }
+}
+
 }  // namespace utils
 }  // namespace genai
 }  // namespace ov

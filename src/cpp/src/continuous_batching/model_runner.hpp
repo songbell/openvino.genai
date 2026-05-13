@@ -441,7 +441,18 @@ public:
             }
         } else if (sequence_group_type == SequenceGroupType::TOKENS) {
             input_ids_data = input_ids.data<int64_t>();
-            position_ids = _get_or_resize_tensor(m_cached_position_ids, "position_ids", {total_num_tokens}, ov::element::i64);
+
+            // Adjust position_ids shape for hidden state import case
+            size_t position_ids_size = total_num_tokens;
+            if (_is_hs_import() && !m_initial_hidden_states.empty()) {
+                auto it = m_initial_hidden_states.begin();
+                const auto& stored_hidden_state = it->second;
+                auto stored_shape = stored_hidden_state.get_shape();
+                if (stored_shape.size() > 0) {
+                    position_ids_size = stored_shape[0] + total_num_tokens; // account for the initial hidden state sequence length
+                }
+            }
+            position_ids = _get_or_resize_tensor(m_cached_position_ids, "position_ids", {position_ids_size}, ov::element::i64);
         }
 
         int64_t
@@ -463,7 +474,9 @@ public:
         try {
             std::ignore = m_request.get_tensor("sampled_tokens_indices");
             matmul_gathering_is_available = true;
-        } catch (const ov::Exception&) {}
+        } catch (const ov::Exception&) {
+            std::cout << "break" << std::endl;
+        }
 
         size_t current_token_idx = 0;
         std::map<size_t, std::set<size_t>> seq_id_to_skipped_blocks_map;
@@ -537,10 +550,22 @@ public:
                     size_t stored_hidden_size = stored_shape[stored_shape.size() - 1];
 
                     OPENVINO_ASSERT(stored_hidden_size == hidden_size, "Target state hidden size does not match the expected size for Eagle3 draft model inference.");
-                    //OPENVINO_ASSERT(stored_seq_len == total_num_tokens, "Target state sequence length does not match the expected length for Eagle3 draft model inference.");
+
+                    // DFlash: Adjust hidden_state_input shape to match stored_hidden_state
+                    // Reshape hidden_state_input if needed to match stored sequence length
+                    if (stored_seq_len != total_num_tokens && hidden_state_input && hidden_state_input.get_size() > 0) {
+                        // Reshape the pre-allocated hidden_state_input to match stored_hidden_state shape
+                        hidden_state_input.set_shape(stored_shape);
+                    }
 
                     // fill the draft model hidden state input with the target hidden state
                     hidden_state_input = stored_hidden_state;
+                    // fill position_ids_data with number of stored_seq_len
+                    auto start = sequence_group->get_num_processed_tokens() - hidden_state_input.get_shape()[0];
+                    for (size_t j = 0; j < stored_seq_len; ++j) {
+                        position_ids_data[position_ids_idx] = start + j;
+                        ++position_ids_idx;
+                    }
                 } else if (_is_hs_internal()) {
                     // fill hidden_state_data with m_hidden_states
                     if (hidden_state_data) {
@@ -563,22 +588,14 @@ public:
                         }
                     }
                 }
+
                 for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id, ++gathering_current_index) {
                     // compute token for current sequence
                     if (sequence_group_type == SequenceGroupType::TOKENS) {
-                        auto tree_pos_ids = sequence->get_tree_metadata().tree_position_ids;
-                        // suppose tree_pos_ids [0, 1, 1, 2, 2, 2, 2,...] means the first token is at position 0 in the tree,
-                        // the second and third tokens are at position 1, and the rest tokens are at position 2, etc.
-                        if (!tree_pos_ids.empty()) {
-                            size_t tree_pos_id = tree_pos_ids[position_ids_idx];
-                            position_ids_data[position_ids_idx] = group_position_id + static_cast<int64_t>(tree_pos_id);
-                        } else {
-                            position_ids_data[position_ids_idx] = (hidden_state_input && hidden_state_input.get_size() > 0 ? 14 : 0) + position_id; // hack for dflash
-                        }
+                        position_ids_data[position_ids_idx] = position_id; // hack to distinguish the position IDs for the draft model in eagle3 speculative drafting stage, which requires hidden state internal handling, from the regular generation stage. The specific value "14" is chosen based on the observation of the position IDs in the Eagle3 draft model, and may need to be adjusted if the model architecture changes.
                         input_ids_data[token_id] = position_id < prompt_len ?
                             sequence_group->get_prompt_ids()[position_id] :
                             sequence->get_generated_ids()[position_id - prompt_len];
-                        position_ids_data[position_ids_idx] = position_id;
                     } else if (sequence_group_type == SequenceGroupType::EMBEDDINGS) {
                         const auto& generated_embeds = sequence->get_generated_ids_embeds();
                         const float* src = position_id < prompt_len ? sequence_group->get_input_embeds()[position_id].data() :  generated_embeds[position_id - prompt_len].data();
@@ -691,7 +708,7 @@ public:
             }
         }
         if (hidden_state_input && hidden_state_input.get_size() > 0) {
-            m_request.set_tensor("target_hidden", hidden_state_input);
+            m_request.set_tensor("hidden_states", hidden_state_input);
         }
         if (position_ids.get_shape().size() == 3 && position_ids.get_shape()[0] == 3 &&
             position_ids.get_shape()[1] == 1) {
@@ -710,7 +727,9 @@ public:
         if (!m_cached_subsequence_begins) {
             m_request.set_tensor("subsequence_begins", subsequence_begins);
         }
-
+        if (_is_hs_import()) {
+            _set_query_to_query_tensors(sequence_groups, scheduler_output);
+        }
         _set_block_indices(sequence_groups, scheduler_output, total_num_blocks, seq_id_to_skipped_blocks_map);
 
         if (!m_cached_block_indices_begins) {
@@ -845,7 +864,35 @@ private:
     bool _is_hs_export()   const { return m_hidden_state_flags & HS_EXPORT; }
     bool _is_hs_import()   const { return m_hidden_state_flags & HS_IMPORT; }
     bool _is_hs_internal() const { return m_hidden_state_flags & HS_INTERNAL; }
+/**
+     * @brief Prepares query-to-query bias tensors for Eagle3 tree decoding.
+     *
+     * Fills two model inputs:
+     * - `qq_bias_begins`: prefix sums of flattened tree-mask lengths for scheduled sequence groups.
+     * - `qq_bias`: flattened tree-mask data for scheduled groups that are in tree-decoding stage
+     *   after the prompt has been fully processed.
+     *
+     * @param sequence_groups Full list of sequence groups; entries are accessed by scheduler IDs.
+     * @param scheduler_output Scheduler result with ordered `m_scheduled_sequence_groups_ids`.
+     */
+    void _set_query_to_query_tensors(const std::vector<SequenceGroup::Ptr>& sequence_groups,
+                                     const Scheduler::Output& scheduler_output) {
+        static constexpr const char* k_qq_bias_name = "qq_bias";
+        static constexpr const char* k_qq_bias_begins_name = "qq_bias_begins";
 
+        const std::vector<uint64_t>& scheduled_ids = scheduler_output.m_scheduled_sequence_groups_ids;
+        const size_t num_sequence_groups = scheduled_ids.size();
+
+        size_t cumulative_mask_length = 0;
+        ov::Tensor qq_bias_begin_tensor = m_request.get_tensor(k_qq_bias_begins_name);
+        qq_bias_begin_tensor.set_shape({num_sequence_groups + 1});
+        int32_t* qq_bias_begin_data = qq_bias_begin_tensor.data<int32_t>();
+        qq_bias_begin_data[0] = 0;
+
+        for (size_t i = 0; i < num_sequence_groups; ++i) {
+            qq_bias_begin_data[i + 1] = 0;
+        }
+    }
     /**
      * @brief Retrieves a slice of the hidden state tensor corresponding to a specific request and sequence group.
      *

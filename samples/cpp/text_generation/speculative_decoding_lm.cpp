@@ -5,14 +5,14 @@
 
 #include "openvino/genai/llm_pipeline.hpp"
 #include "openvino/genai/speculative_decoding/perf_metrics.hpp"
-
+#include "read_prompt_from_file.h"
 int main(int argc, char* argv[]) try {
-    if (4 != argc) {
-        throw std::runtime_error(std::string{"Usage: "} + argv[0] + " <MODEL_DIR> <DRAFT_MODEL_DIR> '<PROMPT>'");
+    if (argc < 4 || argc > 5) {
+        throw std::runtime_error(std::string{"Usage: "} + argv[0] + " <MODEL_DIR> <DRAFT_MODEL_DIR> '<PROMPT>' [MAX_NEW_TOKENS]");
     }
 
     ov::genai::GenerationConfig config;
-    config.max_new_tokens = 100;
+    config.max_new_tokens = (argc == 5) ? std::stoi(argv[4]) : 20;
     // Speculative decoding generation parameters like `num_assistant_tokens` and `assistant_confidence_threshold` are mutually excluded.
     // Add parameter to enable speculative decoding to generate `num_assistant_tokens` candidates by draft_model per iteration.
     // NOTE: ContinuousBatching backend uses `num_assistant_tokens` as is. Stateful backend uses `num_assistant_tokens`'s copy as initial
@@ -27,12 +27,16 @@ int main(int argc, char* argv[]) try {
     std::string main_model_path = argv[1];
     std::string draft_model_path = argv[2];
     std::string prompt = argv[3];
+    if (std::filesystem::is_regular_file(prompt)) {
+        std::string prompt_file = prompt;
+        prompt = utils::read_prompt(prompt_file);
+    }
 
     // User can run main and draft model on different devices.
     // Please, set device for main model in `LLMPipeline` constructor and in `ov::genai::draft_model` for draft.
     // CPU, GPU and NPU can be used. For NPU, the preferred configuration is when both the main and draft models
     // use NPU.
-    std::string main_device = "CPU", draft_device = "CPU";
+    std::string main_device = "GPU.1", draft_device = "GPU.1";
 
     ov::genai::LLMPipeline pipe(
         main_model_path,

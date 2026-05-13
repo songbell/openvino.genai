@@ -103,6 +103,11 @@ void transform_hidden_state(std::shared_ptr<ov::Model>& model, const std::vector
  */
 ov::Tensor slice_hidden_state_for_last_token(const ov::Tensor& hidden_features);
 
+
+/// @brief constructs a model for updating KV cache in eagle3 pipeline based on the main model validation data
+/// @param main_model 
+/// @return the constructed model for updating KV cache in eagle3 pipeline
+std::shared_ptr<ov::Model> construct_eagle3_kv_update_model(const std::shared_ptr<ov::Model>& main_model);
 }  // namespace eagle3
 namespace dflash {
 struct DFlashRTInfo {
@@ -125,6 +130,63 @@ void share_lm_head_weights(const std::shared_ptr<ov::Model>& main_model, const s
 // Reshape shape-input formulas accordingly.
 void normalize_draft_kvproj_concat_axis(std::shared_ptr<ov::Model>& draft_model);
 }  // namespace dflash
+
+/**
+ * @brief Modifies ScaledDotProductAttention nodes in draft model for speculative decoding.
+ *
+ * This function finds all ScaledDotProductAttention (SDPA) nodes in the draft model and:
+ * 1. Removes Reshape node on input 0 (query) if it exists
+ * 2. Removes Unsqueeze nodes on inputs 1 (key) and 2 (value) if they exist
+ *
+ * This preprocessing is required before applying SDPAToPagedAttention transformation
+ * to ensure the draft model works correctly with continuous batching.
+ *
+ * @param draft_model Draft model to modify.
+ */
+void change_draft_sdpa(std::shared_ptr<ov::Model>& draft_model);
+
+/**
+ * @brief Updates positional encoding to relative encoding in draft model.
+ *
+ * This function:
+ * 1. Finds two Multiply nodes: hidden_norm and input_layernorm (layer 0)
+ * 2. Creates a Concat node combining their outputs
+ * 3. Finds the rotary_emb MatMul node and traces back along input 0
+ * 4. Replaces the input_layernorm Multiply usage with the Concat node
+ *
+ * This enables relative positional encoding for D-Flash draft model.
+ *
+ * @param draft_model Draft model to modify.
+ */
+void update_positional_encoding_to_relative(std::shared_ptr<ov::Model>& draft_model);
+
+/**
+ * @brief Updates slice axis in draft model for D-Flash.
+ *
+ * This function:
+ * 1. Finds the Subtract node: __module.model.layers.0.self_attn/aten::sub/Subtract
+ * 2. Finds its two Gather inputs
+ * 3. Dumps Gather indices and axis values for debugging
+ * 4. Modifies Gather to use indices=[0] and axis=0
+ *
+ * @param draft_model Draft model to modify.
+ */
+void update_slice_axis_update(std::shared_ptr<ov::Model>& draft_model);
+
+/**
+ * @brief Updates strided slice axis in draft model for D-Flash.
+ *
+ * This function:
+ * 1. Finds two Slice nodes:
+ *    - __module.model.layers.0.self_attn/aten::narrow/Slice
+ *    - __module.model.layers.0.self_attn/aten::narrow/Slice_1
+ * 2. Dumps all input values for debugging
+ * 3. (Further modifications TBD based on debug output)
+ *
+ * @param draft_model Draft model to modify.
+ */
+void update_strided_slice_axis_update(std::shared_ptr<ov::Model>& draft_model);
+
 }  // namespace utils
 }  // namespace genai
 }  // namespace ov

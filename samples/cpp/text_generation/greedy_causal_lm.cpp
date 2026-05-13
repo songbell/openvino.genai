@@ -2,14 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "openvino/genai/llm_pipeline.hpp"
-
+#include "read_prompt_from_file.h"
 int main(int argc, char* argv[]) try {
     if (3 > argc)
         throw std::runtime_error(std::string{"Usage: "} + argv[0] + " <MODEL_DIR> \"<PROMPT>\"");
 
     std::string models_path = argv[1];
     std::string prompt = argv[2];
-    std::string device = "CPU";  // GPU can be used as well
+    if (std::filesystem::is_regular_file(prompt)) {
+        std::string prompt_file = prompt;
+        prompt = utils::read_prompt(prompt_file);
+    }
+    std::string device = "GPU.1";  // GPU can be used as well
 
     ov::genai::LLMPipeline pipe(models_path, device);
     ov::genai::GenerationConfig config;

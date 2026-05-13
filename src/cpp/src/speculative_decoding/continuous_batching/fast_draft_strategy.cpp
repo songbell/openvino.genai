@@ -7,6 +7,7 @@
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
 #include "fast_draft_strategy.hpp"
 #include "continuous_batching/paged_attention_transformations.hpp"
+#include "speculative_decoding/eagle3_model_transforms.hpp"
 #include "utils.hpp"
 
 
@@ -41,13 +42,19 @@ ContinuousBatchingPipeline::SpeculativeDecodingImpl::init_speculative_models(con
                                    main_model_desc.scheduler_config.use_cache_eviction,
                                    allow_score_aggregation,
                                    allow_xattention).run_on_model(main_model);
+    utils::change_draft_sdpa(draft_model);
+    utils::update_positional_encoding_to_relative(draft_model);
+    utils::update_slice_axis_update(draft_model);
+    utils::update_strided_slice_axis_update(draft_model);
+    //ov::serialize(draft_model, "draft_model_after_sdpa_transformation.xml");
     ov::pass::SDPAToPagedAttention(main_model_desc.scheduler_config.use_cache_eviction,
                                    main_model_desc.scheduler_config.use_cache_eviction,
                                    allow_score_aggregation,
-                                   allow_xattention).run_on_model(draft_model);
-
+                                   allow_xattention,
+                                   false, false, true).run_on_model(draft_model);
+    //ov::serialize(draft_model, "draft_model_after_pa_transformation.xml");
     utils::apply_gather_before_matmul_transformation(main_model);
-    //utils::apply_gather_before_matmul_transformation(draft_model);
+    utils::apply_gather_before_matmul_transformation(draft_model);
 
     bool is_draft_scheduler_undefined = draft_model_desc.scheduler_config == SchedulerConfig();
 

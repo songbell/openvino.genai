@@ -382,10 +382,6 @@ private:
                 size_t num_available_tokens_per_seq = sequence_group->get_num_available_tokens_for_batching();
 
                 size_t num_scheduled_tokens_per_seq = std::min(available_tokens_per_seq_in_megabatch, num_available_tokens_per_seq);
-                if (sequence_group->get_prompt_len() == 0 && sequence_group->get_num_processed_tokens() == 0) {
-                    // for the case when we have no prompt and no generated context (e.g. instruction tuning) we can schedule more tokens to better utilize batch, but not more than max_num_b
-                    m_block_manager->allocate((*sequence_group)[0], 1, 0);
-                }
                 sequence_group->schedule_tokens(num_scheduled_tokens_per_seq);
 
                 while (!m_block_manager->can_append_slots(sequence_group)){

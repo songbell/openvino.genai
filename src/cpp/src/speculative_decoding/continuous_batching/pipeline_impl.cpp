@@ -204,13 +204,6 @@ init_request(
         auto log_probs = candidate_sequence.second.log_probs;
         token_ids.resize(min_candidate_len);
         log_probs.resize(min_candidate_len);
-        std::vector<int64_t> draft_prompt_ids;
-        /*draft_prompt_ids.resize(15);
-        draft_prompt_ids[0] = token_ids[0];
-        for (size_t i = 1; i < 15; i++) {
-            draft_prompt_ids[i] = 151669; // dflash special token id for padding
-        }*/
-        request->update_prompts(draft_prompt_ids);
 
         for (size_t i = 0; i < min_candidate_len; ++i) {
             sequence->append_token(token_ids[i], log_probs[i]);
@@ -299,16 +292,26 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
                 candidate_token_log_probs.resize(min_candidate_len);
                 result.inserted_tokens_cnt = insert_tokens_to_sequence(running_sequence, candidate_token_ids, candidate_token_log_probs, logit_processor, is_update_logit_processor);
                 // handle hidden states for eagle mode
-                if (eagle_mode_enabled && !m_is_validation_mode_enabled && result.inserted_tokens_cnt > 0) { // update hidden states for draft model
+                if (!m_is_validation_mode_enabled && result.inserted_tokens_cnt > 0) { // update hidden states for draft model
                     // at least there should be one bonus token from main
                     auto& hidden_state = candidate_sequence.hidden_states;
                     ov::Tensor pruned_hidden_state = truncate_hidden_state_from_end(hidden_state, result.removed_tokens_cnt);
+                    //std::cout << "removed tokens cnt: " << result.removed_tokens_cnt << std::endl;
                     const auto& shape = pruned_hidden_state.get_shape();
                     OPENVINO_ASSERT(shape[0] >= 1, "Unexpected hidden state shape from the main model.");
                     m_model_runner->set_initial_hidden_state(request_id,
                                                             pruned_hidden_state);
                     // to calculate the number of tokens that needs to do kv cache re-generate in draft model
                     num_tokens_needs_kv_update = shape[0] - 1; // remove the first dim, which is the reliable hidden state from main model
+                }
+                if (!m_is_validation_mode_enabled) {
+                        for (size_t i = 0; i < 15; ++i) {
+                        running_sequence->append_token(151669, 0.0f);
+                        if (is_update_logit_processor) {
+                            logit_processor.register_new_generated_token(151669);
+                            logit_processor.update_generated_len(running_sequence->get_generated_len());
+                        }
+                    }
                 }
             }
             // we should update a logit processor just for draft model to generate the same tokens
@@ -327,17 +330,17 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
         if (num_tokens_needs_kv_update > 0) {
             if (generated_len > 0) {
                 // in eagle3 speculative mode, to rewind the processed tokens num to the stable kv position
-                request->update_processed_tokens_num(num_processed_tokens - result.removed_tokens_cnt + 1 - num_tokens_needs_kv_update);
+                request->update_processed_tokens_num(num_processed_tokens - result.removed_tokens_cnt);
             }
         } else { // fast draft or main model for eagle speculative
             if (generated_len > 0 && result.removed_tokens_cnt > 0) {
-                request->update_processed_tokens_num(num_processed_tokens - result.removed_tokens_cnt + 1);
+                request->update_processed_tokens_num(num_processed_tokens - result.removed_tokens_cnt);
             }
         }
         if (num_tokens_needs_kv_update < 0 && result.inserted_tokens_cnt > 0 && result.removed_tokens_cnt == 0) {
             request->set_num_validated_tokens(result.inserted_tokens_cnt);
-        } else if (num_tokens_needs_kv_update >= 0) {
-            request->set_num_validated_tokens(num_tokens_needs_kv_update);  // in generation stage
+        } else if (result.inserted_tokens_cnt > 0) {
+            request->set_num_validated_tokens(15); // hard code in validation stage
         }
         // to pause `draft_model` generation in case of `generated_len >= max_new_tokens - 1` to generate last token by `main_model`
         // Start `draft_model` generation after the first `main_model` generation is finished. There are two scenarios:
@@ -348,7 +351,8 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::update
         if (!m_is_validation_mode_enabled) {
             bool pause_gen_status = false;
             generated_len -= result.removed_tokens_cnt;
-            generated_len += result.inserted_tokens_cnt;
+            //printf("generated_len %d\n ", generated_len);
+            //generated_len += 15;
             if (generated_len >= max_new_tokens - 1 || generated_len != 0 && result.inserted_tokens_cnt == 0) {
                 pause_gen_status = true;
             }
@@ -377,6 +381,13 @@ ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::pull_a
     }
     m_requests.insert(m_requests.end(), m_awaiting_requests.begin(), m_awaiting_requests.end());
     m_awaiting_requests.clear();
+}
+
+void
+ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::pause_requests() {
+    for (auto& request : m_requests) {
+        request->pause_generation(true);
+    }
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::multistep() {
@@ -427,5 +438,64 @@ void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::m
     }
     if (eagle_mode_enabled)
         m_model_runner->enable_hidden_state_import(true);
+}
+
+void ContinuousBatchingPipeline::ContinuousBatchingForSpeculativeDecodingImpl::schedule_only_step() {
+    // Pull awaiting requests first
+    _pull_awaiting_requests();
+
+    // Only perform scheduling to allocate KV cache blocks
+    // This is the key part: we call schedule() but NOT forward() or sample()
+    Scheduler::Output scheduler_output = m_scheduler->schedule(m_requests);
+
+    // Update metrics
+    m_pipeline_metrics.kv_cache_size_in_bytes = scheduler_output.m_cache_size_in_bytes;
+    m_pipeline_metrics.scheduled_requests = scheduler_output.m_scheduled_sequence_groups_ids.size();
+    m_pipeline_metrics.cache_usage = scheduler_output.m_cache_usage;
+    m_pipeline_metrics.max_cache_usage = std::max(m_pipeline_metrics.max_cache_usage, scheduler_output.m_cache_usage);
+    _register_step_cache_usage(scheduler_output.m_cache_usage);
+    m_pipeline_metrics.avg_cache_usage = _get_current_running_average_cache_usage();
+
+    // Handle cache eviction config if needed
+    const auto& sched_config = m_scheduler->get_config();
+    if (sched_config.use_cache_eviction) {
+        if (sched_config.cache_eviction_config.apply_rotation) {
+            _compute_cache_rotation_data(m_requests, scheduler_output);
+            m_model_runner->set_cache_rotation_data(std::move(m_current_step_rotated_block_indices_per_sequence),
+                                                    std::move(m_current_step_rotation_deltas));
+        }
+    }
+
+    // If no tokens were scheduled (out of memory), handle gracefully
+    if (scheduler_output.m_total_num_scheduled_tokens == 0) {
+        for (size_t i = 0; i < m_requests.size(); ++i) {
+            SequenceGroup::Ptr sequence_group = m_requests[i];
+            if (!sequence_group->is_waiting()) {
+                sequence_group->set_out_of_memory();
+                sequence_group->notify_handle();
+            }
+        }
+        _free_non_running_requests();
+        return;
+    }
+
+    // NOTE: We do NOT call m_model_runner->forward() or m_sampler->sample() here!
+    // This is intentional - we only want to allocate KV cache blocks.
+    //
+    // After this call:
+    // 1. KV cache blocks are allocated by the scheduler
+    // 2. Block tables are updated
+    // 3. The pipeline is ready for multistep() to actually generate tokens
+    //
+    // This is used for DFlash draft model's "virtual prefill" where we need
+    // to allocate KV cache before the draft model starts generating candidates.
+    //
+    // IMPORTANT: Reset scheduled tokens to 0 since we didn't actually process them
+    // The scheduler allocated blocks and set m_num_scheduled_tokens, but we need to
+    // clear it because no actual forward pass was executed.
+    for (auto& sequence_group : m_requests) {
+        sequence_group->update_processed_tokens_num(sequence_group->get_num_scheduled_tokens());
+        sequence_group->clear_scheduled_tokens();
+    }
 }
 }
