@@ -447,7 +447,10 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
     {
         static ManualTimer timer("sample");
         timer.start();
+        const auto sample_start = std::chrono::steady_clock::now();
         sampler_output = m_sampler->sample(m_requests, logits, m_is_validation_mode_enabled);
+        m_pipeline_metrics.sampling_duration =
+            PerfMetrics::get_microsec(std::chrono::steady_clock::now() - sample_start);
         m_batch_size = sampler_output.num_generated_tokens;
         timer.end();
     }
@@ -477,9 +480,14 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         candidates_timer.end();
     }
 
-    // append embeddings for generated tokens
-    if (m_model_input_type == ModelInputType::EMBEDDINGS)
+    // Append embeddings for tokens produced in this step.
+    // Validation mode usually skips this because speculative validation reuses/rewinds
+    // candidate tokens instead of committing them here. prompt_lookup is the exception:
+    // it appends validation candidates after sampling and must keep embeddings in sync
+    // before the next scheduling/hash step.
+    if (m_model_input_type == ModelInputType::EMBEDDINGS && sync_embeddings_after_candidates()) {
         m_model_runner->append_embeddings(m_requests, scheduler_output);
+    }
 
     // notify requests dropped by handle
     {
