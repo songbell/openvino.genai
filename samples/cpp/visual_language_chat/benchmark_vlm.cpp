@@ -104,7 +104,7 @@ int main(int argc, char* argv[]) try {
 
             scheduler_config.use_sparse_attention = true;
             scheduler_config.sparse_attention_config = sparse_attention_config;
-            properties.insert(ov::hint::kv_cache_precision(ov::element::i8));
+            //properties.insert(ov::hint::kv_cache_precision(ov::element::i8));
         }
         properties.insert(ov::genai::scheduler_config(scheduler_config));
         pipe = std::make_unique<ov::genai::VLMPipeline>(models_path, device, properties);

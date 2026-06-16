@@ -143,7 +143,7 @@ def main():
     else:
         # Setting of Scheduler config will trigger usage of ContinuousBatching pipeline, which is not default for Qwen2VL, Qwen2.5VL, Gemma3 due to accuracy issues.
         scheduler_config = scheduler_config_from_cm_path(args.cm_path)
-        pipe = ov_genai.VLMPipeline(models_path, device, scheduler_config=scheduler_config)
+        pipe = ov_genai.VLMPipeline(models_path, device, scheduler_config=scheduler_config, **properties)
 
     tokenizer = pipe.get_tokenizer()
     prompt = tokenizer.apply_chat_template(

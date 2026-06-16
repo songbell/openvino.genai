@@ -55,7 +55,7 @@ int main(int argc, char* argv[]) try {
     if (device == "GPU") {
         // Cache compiled models on disk for GPU to save time on the
         // next run. It's not beneficial for CPU.
-        //properties.insert({ov::cache_dir("vlm_cache")});
+        // properties.insert({ov::cache_dir("vlm_cache")});
     }
     //properties.insert(ov::hint::kv_cache_precision(ov::element::f16));
     ov::genai::VLMPipeline pipe(argv[1], device, properties);
