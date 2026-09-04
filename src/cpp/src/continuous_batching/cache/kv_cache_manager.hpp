@@ -303,6 +303,11 @@ public:
         OPENVINO_ASSERT(block_id < m_num_allocated_kv_blocks, "Invalid KV cache block ID ", block_id);
 
         const KVCacheDiskLayout layout = get_block_layout();
+        GENAI_INFO("[KV_TRACE] KVCacheManager read_block physical_block=%zu bytes=%zu device=%s remote=%s",
+                   block_id,
+                   layout.get_slot_size(),
+                   m_device.c_str(),
+                   m_context ? "true" : "false");
         std::vector<uint8_t> block_data(layout.get_slot_size());
         for (size_t layer = 0; layer < m_num_layers; ++layer) {
             const auto key_segment = layout.get_key_segment(layer);
@@ -320,6 +325,11 @@ public:
         OPENVINO_ASSERT(block_data.size() == layout.get_slot_size(),
                         "Unexpected KV cache block byte size: got ", block_data.size(),
                         ", expected ", layout.get_slot_size());
+                GENAI_INFO("[KV_TRACE] KVCacheManager write_block physical_block=%zu bytes=%zu device=%s remote=%s",
+                       block_id,
+                       block_data.size(),
+                       m_device.c_str(),
+                       m_context ? "true" : "false");
 
         for (size_t layer = 0; layer < m_num_layers; ++layer) {
             const auto key_segment = layout.get_key_segment(layer);
@@ -328,6 +338,7 @@ public:
             copy_block_to_tensor(m_value_cache[layer], block_id, block_data.data() + value_segment.offset, value_segment.size);
         }
     }
+
 
 private:
     static size_t get_block_byte_size(const ov::PartialShape& cache_shape, const ov::element::Type& precision) {
@@ -367,10 +378,11 @@ private:
                                        size_t block_bytes) {
         assert_block_stride(tensor, block_bytes);
         if (tensor.is<ov::RemoteTensor>()) {
-            // Device memory exposes no host pointer, so the block is staged through a host tensor.
-            ov::Tensor host_block(tensor.get_element_type(), get_single_block_shape(tensor));
-            make_block_roi(tensor, block_id).copy_to(host_block);
-            std::memcpy(destination, host_block.data(), block_bytes);
+            // Device memory exposes no host pointer, so the copy is aimed straight at the caller's
+            // buffer wrapped as a tensor; staging through an owned tensor would add an allocation
+            // and a second copy to every block of every layer.
+            ov::Tensor destination_view(tensor.get_element_type(), get_single_block_shape(tensor), destination);
+            make_block_roi(tensor, block_id).copy_to(destination_view);
             return;
         }
         const auto* source = static_cast<const uint8_t*>(tensor.data()) + block_id * block_bytes;
@@ -383,14 +395,16 @@ private:
                                      size_t block_bytes) {
         assert_block_stride(tensor, block_bytes);
         if (tensor.is<ov::RemoteTensor>()) {
-            ov::Tensor host_block(tensor.get_element_type(), get_single_block_shape(tensor));
-            std::memcpy(host_block.data(), source, block_bytes);
-            make_block_roi(tensor, block_id).copy_from(host_block);
+            ov::Tensor source_view(tensor.get_element_type(),
+                                   get_single_block_shape(tensor),
+                                   const_cast<uint8_t*>(source));
+            make_block_roi(tensor, block_id).copy_from(source_view);
             return;
         }
         auto* destination = static_cast<uint8_t*>(tensor.data()) + block_id * block_bytes;
         std::memcpy(destination, source, block_bytes);
     }
+
 
 public:
 

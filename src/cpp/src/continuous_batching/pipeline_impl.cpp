@@ -22,6 +22,7 @@
 #include "lora/helper.hpp"
 #include "openvino/genai/text_streamer.hpp"
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
+#include "logger.hpp"
 #include "utils.hpp"
 
 namespace {
@@ -396,6 +397,12 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
             std::max(m_pipeline_metrics.max_cache_usage, scheduler_output.m_cache_usage);
         _register_step_cache_usage(scheduler_output.m_cache_usage);
         m_pipeline_metrics.avg_cache_usage = _get_current_running_average_cache_usage();
+
+        GENAI_INFO("[KV_TRACE] step scheduled_groups=%zu scheduled_tokens=%zu cache_usage=%.2f cache_bytes=%zu",
+               scheduler_output.m_scheduled_sequence_groups_ids.size(),
+               scheduler_output.m_total_num_scheduled_tokens,
+               scheduler_output.m_cache_usage,
+               scheduler_output.m_cache_size_in_bytes);
 
         const auto& sched_config = m_scheduler->get_config();
         if (sched_config.use_cache_eviction) {

@@ -10,6 +10,8 @@
 #include <limits>
 #include <random>
 
+#include "logger.hpp"
+
 #ifdef _WIN32
 #    include <fcntl.h>
 #    include <io.h>
@@ -176,6 +178,9 @@ std::optional<size_t> KVCacheOffloadManager::acquire_slot() {
     }
     const size_t slot_id = m_free_slots.back();
     m_free_slots.pop_back();
+    GENAI_INFO("[KV_TRACE] KVCacheOffloadManager acquire_slot slot=%zu free_after=%zu",
+               slot_id,
+               m_free_slots.size());
     return slot_id;
 }
 
@@ -187,6 +192,9 @@ void KVCacheOffloadManager::release_slot(size_t slot_id) {
                     slot_id,
                     " is released twice");
     m_free_slots.push_back(slot_id);
+    GENAI_INFO("[KV_TRACE] KVCacheOffloadManager release_slot slot=%zu free_after=%zu",
+               slot_id,
+               m_free_slots.size());
 }
 
 void KVCacheOffloadManager::write_slot(size_t slot_id, const std::vector<uint8_t>& block_data) {
@@ -198,6 +206,10 @@ void KVCacheOffloadManager::write_slot(size_t slot_id, const std::vector<uint8_t
                     m_slot_size);
 
     std::lock_guard<std::mutex> lock(m_mutex);
+    GENAI_INFO("[KV_TRACE] KVCacheOffloadManager write_slot slot=%zu offset=%zu bytes=%zu",
+               slot_id,
+               m_layout.get_slot_offset(slot_id),
+               block_data.size());
     write_at(m_layout.get_slot_offset(slot_id), block_data.data(), m_slot_size);
 }
 
@@ -206,6 +218,10 @@ void KVCacheOffloadManager::read_slot(size_t slot_id, std::vector<uint8_t>& bloc
     block_data.resize(m_slot_size);
 
     std::lock_guard<std::mutex> lock(m_mutex);
+    GENAI_INFO("[KV_TRACE] KVCacheOffloadManager read_slot slot=%zu offset=%zu bytes=%zu",
+               slot_id,
+               m_layout.get_slot_offset(slot_id),
+               m_slot_size);
     read_at(m_layout.get_slot_offset(slot_id), block_data.data(), m_slot_size);
 }
 

@@ -110,6 +110,7 @@ public:
      * @return false if the contents are unavailable, in which case the block is left untouched.
      */
     virtual bool load_into(size_t hash, size_t block_index) = 0;
+
 };
 
 /**
@@ -152,6 +153,10 @@ class OverwritableBlocksHashStore {
             }
         }
         OPENVINO_ASSERT(m_blocks.count(hash) == 0);
+        const auto timestamp = std::chrono::steady_clock::now();
+        for (const auto& block : blocks_for_all_layers) {
+            block->set_timestamp(timestamp);
+        }
         m_blocks[hash] = blocks_for_all_layers;
     }
 

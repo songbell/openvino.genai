@@ -82,6 +82,16 @@ public:
         config.num_kv_blocks = num_kv_blocks;
         config.num_linear_attention_blocks = num_la_blocks;
 
+        GENAI_INFO("[KV_TRACE] orchestrator kv_cache=%s linear_cache=%s cache_tensors=%zu device=%s kv_blocks=%zu linear_blocks=%zu cache_interval=%zu prefix=%s",
+               kv_mgr ? "true" : "false",
+               la_mgr ? "true" : "false",
+               num_cache_tensors,
+               allocation_device.c_str(),
+               num_kv_blocks,
+               num_la_blocks,
+               cache_interval,
+               config.enable_prefix_caching ? "true" : "false");
+
         if (kv_mgr) {
             orchestrator->register_kv_cache(std::move(kv_mgr), config);
         }
@@ -159,7 +169,14 @@ public:
 
     void allocate_cache_if_needed() {
         for (auto& [type, block_mgr] : m_block_managers) {
-            m_cache_managers.at(type)->allocate_cache_if_needed(block_mgr->get_total_block_count());
+            const size_t requested_blocks = block_mgr->get_total_block_count();
+            if (m_cache_managers.at(type)->get_num_allocated_blocks() < requested_blocks) {
+                GENAI_INFO("[KV_TRACE] allocate_cache_if_needed type=%d blocks=%zu free_blocks=%zu",
+                           static_cast<int>(type),
+                           requested_blocks,
+                           block_mgr->num_free_blocks());
+                m_cache_managers.at(type)->allocate_cache_if_needed(requested_blocks);
+            }
         }
         for (auto& [type, block_indices] : m_pending_zero_blocks) {
             m_cache_managers.at(type)->zero_blocks(block_indices);
@@ -169,6 +186,9 @@ public:
 
     void copy_blocks(const std::map<CacheType, std::map<size_t, std::list<size_t>>>& per_type_copy_map) {
         for (const auto& [type, copy_map] : per_type_copy_map) {
+            GENAI_INFO("[KV_TRACE] copy_blocks type=%d source_blocks=%zu",
+                       static_cast<int>(type),
+                       copy_map.size());
             m_cache_managers.at(type)->copy_blocks(copy_map);
         }
     }

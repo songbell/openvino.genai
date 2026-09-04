@@ -64,6 +64,9 @@ SchedulerConfig make_scheduler_config(bool use_offload) {
     if (use_offload) {
         // Room for far more blocks than the device cache holds, so eviction lands on disk.
         config.cache_offload_config.capacity_bytes = 8u * 1024u * 1024u;
+        // Freeing a sequence releases its whole block table at once, so a staging pool smaller than
+        // that burst silently drops most of the blocks and the disk cache fills up only slowly.
+        config.cache_offload_config.buffer_slots = 128;
     }
     return config;
 }
@@ -128,6 +131,53 @@ uint64_t measure_device_bytes(const std::string& model_path, bool use_offload) {
     return held;
 }
 
+/**
+ * @brief Mean time to first token of the request that follows the cache-filling one.
+ *
+ * That request is the only one whose prefix may still be available, so its prefill cost is what
+ * separates a cache hit from a full recomputation. Prompts are long on purpose: with a short one the
+ * per-request overhead dwarfs the prefill and the comparison measures nothing.
+ */
+float measure_repeated_prefix_ttft(const std::string& model_path, size_t num_kv_blocks, bool use_offload) {
+    auto scheduler_config = make_scheduler_config(use_offload);
+    scheduler_config.num_kv_blocks = num_kv_blocks;
+    scheduler_config.max_num_batched_tokens = 4096;
+    ContinuousBatchingPipeline pipeline(model_path, scheduler_config, offload_e2e_device());
+
+    const std::string shared_prefix = repeat("The quick brown fox jumps over the lazy dog. ", 80);
+    // Long enough to displace the shared prefix from the halved cache, short enough to still fit in
+    // it; a filler that does not fit is never scheduled and then nothing gets displaced at all.
+    const std::string filler = repeat("Completely unrelated tokens to evict the cached prefix. ", 120);
+    const auto generation_config = make_greedy_config();
+
+    // One untimed round first: on GPU the very first requests pay kernel compilation, which would
+    // otherwise be charged entirely to whichever configuration runs first.
+    auto run_round = [&](size_t iteration) {
+        pipeline.generate({shared_prefix + " First continuation:"}, {generation_config});
+        // The filler has to differ every round, otherwise it is served from the cache from the
+        // second round on and stops displacing the shared prefix.
+        auto filler_results =
+            pipeline.generate({"Round " + std::to_string(iteration) + ". " + filler}, {generation_config});
+        EXPECT_FALSE(filler_results.at(0).m_generation_ids.at(0).empty())
+            << "the filler request was dropped, so it never displaced the shared prefix";
+        return pipeline.generate({shared_prefix + " Second continuation:"}, {generation_config});
+    };
+
+    constexpr size_t NUM_ITERATIONS = 5;
+    run_round(0);
+
+    float total_ttft_ms = 0.0f;
+    for (size_t iteration = 0; iteration < NUM_ITERATIONS; ++iteration) {
+        total_ttft_ms += run_round(iteration + 1).at(0).perf_metrics.get_ttft().mean;
+    }
+    return total_ttft_ms / NUM_ITERATIONS;
+}
+
+/// @return A block count holding the filler prompt but not the filler plus the shared prefix.
+size_t perf_halved_blocks(const std::string& device) {
+    return device.find("GPU") != std::string::npos ? 128 : 64;
+}
+
 }  // namespace
 
 TEST(TestKVCacheOffloadEndToEnd, ProducesTheSameTextAsWithoutOffload) {
@@ -164,6 +214,33 @@ TEST(TestKVCacheOffloadEndToEnd, DoesNotGrowDeviceMemory) {
     // must not add device allocations of its own.
     EXPECT_LE(with_offload, without_offload)
         << "enabling offload increased device memory by " << (with_offload - without_offload) << " bytes";
+}
+
+TEST(TestKVCacheOffloadEndToEnd, ComparesHalvedCacheWithAndWithoutOffload) {
+    const char* model_path = std::getenv(MODEL_PATH_ENV);
+    if (model_path == nullptr || *model_path == '\0') {
+        GTEST_SKIP() << MODEL_PATH_ENV << " is not set, skipping KV cache offload end-to-end test.";
+    }
+
+    // The halved cache cannot hold the shared prefix across the filler request, the full one can.
+    const size_t halved_blocks = perf_halved_blocks(offload_e2e_device());
+    const size_t full_blocks = halved_blocks * 2;
+
+    const float full_cache = measure_repeated_prefix_ttft(model_path, full_blocks, /*use_offload=*/false);
+    const float halved_cache = measure_repeated_prefix_ttft(model_path, halved_blocks, /*use_offload=*/false);
+    const float halved_cache_offloaded = measure_repeated_prefix_ttft(model_path, halved_blocks, /*use_offload=*/true);
+
+    std::cout << "[ PERF     ] TTFT of the repeated prefix, mean over 5 rounds\n"
+              << "[ PERF     ]   A  " << full_blocks << " blocks, no offload : " << full_cache << " ms\n"
+              << "[ PERF     ]   B  " << halved_blocks << " blocks, no offload : " << halved_cache << " ms\n"
+              << "[ PERF     ]   C  " << halved_blocks << " blocks, offload    : " << halved_cache_offloaded << " ms"
+              << std::endl;
+
+    // Timings are reported rather than asserted: whether restoring from disk beats recomputing the
+    // prefix depends on how expensive prefill is for the model under test.
+    EXPECT_GT(full_cache, 0.0f);
+    EXPECT_GT(halved_cache, 0.0f);
+    EXPECT_GT(halved_cache_offloaded, 0.0f);
 }
 
 TEST(TestKVCacheOffloadEndToEnd, RejectsConfigurationsTheBackendCannotServe) {

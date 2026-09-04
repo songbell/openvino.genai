@@ -42,6 +42,11 @@ public:
         std::size_t num_loaded = 0;
         std::size_t num_failed = 0;
         std::size_t num_dropped_no_buffer = 0;
+        // TEMPORARY diagnostics, to be removed once the GPU cost breakdown is settled.
+        std::size_t store_read_us = 0;
+        std::size_t store_write_us = 0;
+        std::size_t load_disk_us = 0;
+        std::size_t load_write_us = 0;
     };
 
     /**
