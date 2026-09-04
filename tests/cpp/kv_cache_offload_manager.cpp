@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <numeric>
 
 #include "continuous_batching/cache/kv_cache_offload_manager.hpp"
@@ -173,6 +174,245 @@ TEST(TestKVCacheOffloadManager, UsesConfiguredDirectory) {
         KVCacheOffloadManager manager(make_layout(), config, "CPU");
         EXPECT_EQ(manager.get_file_path().parent_path(), directory);
     }
+
+    std::filesystem::remove_all(directory);
+}
+
+namespace {
+
+CacheOffloadConfig make_persistent_config(size_t num_slots, const std::filesystem::path& directory) {
+    CacheOffloadConfig config = make_config(num_slots);
+    config.path = directory.string();
+    config.enable_persistence = true;
+    config.model_fingerprint = "model-a";
+    config.tokenizer_fingerprint = "tokenizer-a";
+    return config;
+}
+
+class PersistentCacheDirFixture : public ::testing::Test {
+protected:
+    void SetUp() override {
+        directory = std::filesystem::temp_directory_path() /
+                    ("ov_genai_offload_persist_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()) +
+                     "_" + std::to_string(reinterpret_cast<uintptr_t>(this)));
+        std::filesystem::create_directories(directory);
+    }
+
+    void TearDown() override {
+        std::filesystem::remove_all(directory);
+    }
+
+    std::filesystem::path directory;
+};
+
+}  // namespace
+
+TEST_F(PersistentCacheDirFixture, RequiresPathAndFingerprints) {
+    CacheOffloadConfig config = make_config(2);
+    config.enable_persistence = true;
+    // No path, no fingerprints set.
+    EXPECT_THROW(KVCacheOffloadManager(make_layout(), config, "CPU"), ov::Exception);
+
+    config.path = directory.string();
+    // Fingerprints still empty.
+    EXPECT_THROW(KVCacheOffloadManager(make_layout(), config, "CPU"), ov::Exception);
+
+    config.model_fingerprint = "model-a";
+    // tokenizer_fingerprint still empty.
+    EXPECT_THROW(KVCacheOffloadManager(make_layout(), config, "CPU"), ov::Exception);
+}
+
+TEST_F(PersistentCacheDirFixture, FreshPersistentCacheHasNoRecoveredEntries) {
+    KVCacheOffloadManager manager(make_layout(), make_persistent_config(3, directory), "CPU");
+    EXPECT_TRUE(manager.get_recovered_entries().empty());
+    EXPECT_TRUE(std::filesystem::exists(manager.get_file_path()));
+}
+
+TEST_F(PersistentCacheDirFixture, SurvivesDestructionAndIsRecoveredOnReopen) {
+    const auto config = make_persistent_config(3, directory);
+    const auto first_data = make_pattern(11);
+    const auto second_data = make_pattern(99);
+
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU");
+        manager.write_slot(0, first_data, /*hash=*/42);
+        manager.write_slot(2, second_data, /*hash=*/77);
+        // manager destructs here; files must survive since persistence is enabled.
+    }
+
+    ASSERT_TRUE(std::filesystem::exists(directory / "ov_genai_kv_offload.data"));
+    ASSERT_TRUE(std::filesystem::exists(directory / "ov_genai_kv_offload.manifest"));
+
+    KVCacheOffloadManager manager(make_layout(), config, "CPU");
+    const auto& recovered = manager.get_recovered_entries();
+    ASSERT_EQ(recovered.size(), 2u);
+
+    std::size_t slot_for_42 = static_cast<std::size_t>(-1);
+    std::size_t slot_for_77 = static_cast<std::size_t>(-1);
+    for (const auto& entry : recovered) {
+        if (entry.first == 42) {
+            slot_for_42 = entry.second;
+        } else if (entry.first == 77) {
+            slot_for_77 = entry.second;
+        }
+    }
+    ASSERT_EQ(slot_for_42, 0u);
+    ASSERT_EQ(slot_for_77, 2u);
+
+    std::vector<uint8_t> actual;
+    manager.read_slot(0, actual);
+    EXPECT_EQ(actual, first_data);
+    manager.read_slot(2, actual);
+    EXPECT_EQ(actual, second_data);
+
+    // Recovered slots must not be handed out as free slots.
+    EXPECT_EQ(manager.get_num_free_slots(), 1u);
+}
+
+TEST_F(PersistentCacheDirFixture, MismatchedModelFingerprintRebuildsFresh) {
+    auto config = make_persistent_config(3, directory);
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU");
+        manager.write_slot(0, make_pattern(11), /*hash=*/42);
+    }
+
+    config.model_fingerprint = "model-b";
+    KVCacheOffloadManager manager(make_layout(), config, "CPU");
+    EXPECT_TRUE(manager.get_recovered_entries().empty());
+    EXPECT_EQ(manager.get_num_free_slots(), manager.get_num_slots());
+}
+
+TEST_F(PersistentCacheDirFixture, MismatchedTokenizerFingerprintRebuildsFresh) {
+    auto config = make_persistent_config(3, directory);
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU");
+        manager.write_slot(0, make_pattern(11), /*hash=*/42);
+    }
+
+    config.tokenizer_fingerprint = "tokenizer-b";
+    KVCacheOffloadManager manager(make_layout(), config, "CPU");
+    EXPECT_TRUE(manager.get_recovered_entries().empty());
+}
+
+TEST_F(PersistentCacheDirFixture, MismatchedLayoutRebuildsFresh) {
+    auto config = make_persistent_config(3, directory);
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU");
+        manager.write_slot(0, make_pattern(11), /*hash=*/42);
+    }
+
+    // A layout with a different key-segment size changes the layout fingerprint even though the
+    // overall slot size (and therefore file sizes) stays comparable.
+    KVCacheDiskLayout different_layout(std::vector<size_t>(NUM_LAYERS, KEY_BLOCK_BYTES + 8),
+                                        std::vector<size_t>(NUM_LAYERS, VALUE_BLOCK_BYTES - 8));
+    KVCacheOffloadManager manager(different_layout, config, "CPU");
+    EXPECT_TRUE(manager.get_recovered_entries().empty());
+}
+
+TEST_F(PersistentCacheDirFixture, MismatchedSlotCountRebuildsFresh) {
+    auto config = make_persistent_config(3, directory);
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU");
+        manager.write_slot(0, make_pattern(11), /*hash=*/42);
+    }
+
+    config.capacity_bytes = 5 * SLOT_BYTES;
+    KVCacheOffloadManager manager(make_layout(), config, "CPU");
+    EXPECT_TRUE(manager.get_recovered_entries().empty());
+    EXPECT_EQ(manager.get_num_slots(), 5u);
+}
+
+TEST_F(PersistentCacheDirFixture, TornManifestRecordIsIgnoredNotCrashed) {
+    const auto config = make_persistent_config(3, directory);
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU");
+        manager.write_slot(0, make_pattern(11), /*hash=*/42);
+        manager.write_slot(1, make_pattern(22), /*hash=*/43);
+    }
+
+    // Simulate a crash between the hash/checksum write and the valid-flag write for slot 1: flip its
+    // valid flag back to 0 by directly patching the manifest file.
+    constexpr std::size_t MANIFEST_HEADER_SIZE = 48;
+    constexpr std::size_t MANIFEST_RECORD_SIZE = 24;
+    const auto manifest_path = directory / "ov_genai_kv_offload.manifest";
+    {
+        std::fstream manifest(manifest_path, std::ios::in | std::ios::out | std::ios::binary);
+        ASSERT_TRUE(manifest.is_open());
+        const std::size_t valid_flag_offset = MANIFEST_HEADER_SIZE + 1 * MANIFEST_RECORD_SIZE + 16;
+        uint32_t zero = 0;
+        manifest.seekp(static_cast<std::streamoff>(valid_flag_offset));
+        manifest.write(reinterpret_cast<const char*>(&zero), sizeof(zero));
+    }
+
+    KVCacheOffloadManager manager(make_layout(), config, "CPU");
+    const auto& recovered = manager.get_recovered_entries();
+    ASSERT_EQ(recovered.size(), 1u);
+    EXPECT_EQ(recovered.front().first, 42u);
+    EXPECT_EQ(recovered.front().second, 0u);
+
+    std::vector<uint8_t> actual;
+    manager.read_slot(0, actual);
+    EXPECT_EQ(actual, make_pattern(11));
+}
+
+TEST_F(PersistentCacheDirFixture, CorruptedDataDetectedAsChecksumMismatchOnRead) {
+    const auto config = make_persistent_config(3, directory);
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU");
+        manager.write_slot(0, make_pattern(11), /*hash=*/42);
+    }
+
+    // Corrupt the persisted data bytes for slot 0 directly on disk.
+    const auto data_path = directory / "ov_genai_kv_offload.data";
+    {
+        std::fstream data_file(data_path, std::ios::in | std::ios::out | std::ios::binary);
+        ASSERT_TRUE(data_file.is_open());
+        data_file.seekp(0);
+        char garbage = '\xFF';
+        data_file.write(&garbage, 1);
+    }
+
+    KVCacheOffloadManager manager(make_layout(), config, "CPU");
+    ASSERT_EQ(manager.get_recovered_entries().size(), 1u);
+
+    std::vector<uint8_t> actual;
+    EXPECT_THROW(manager.read_slot(0, actual), ov::Exception);
+}
+
+TEST_F(PersistentCacheDirFixture, WriteWithoutHashIsNotPersisted) {
+    const auto config = make_persistent_config(3, directory);
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU");
+        manager.write_slot(0, make_pattern(11));  // no hash: soft degradation, not an error.
+    }
+
+    KVCacheOffloadManager manager(make_layout(), config, "CPU");
+    EXPECT_TRUE(manager.get_recovered_entries().empty());
+}
+
+TEST_F(PersistentCacheDirFixture, RemovePersistedCacheDeletesFilesAndAllowsFreshStart) {
+    const auto config = make_persistent_config(3, directory);
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU");
+        manager.write_slot(0, make_pattern(11), /*hash=*/42);
+    }
+
+    ASSERT_TRUE(std::filesystem::exists(directory / "ov_genai_kv_offload.data"));
+    ASSERT_TRUE(std::filesystem::exists(directory / "ov_genai_kv_offload.manifest"));
+
+    KVCacheOffloadManager::remove_persisted_cache(directory);
+    EXPECT_FALSE(std::filesystem::exists(directory / "ov_genai_kv_offload.data"));
+    EXPECT_FALSE(std::filesystem::exists(directory / "ov_genai_kv_offload.manifest"));
+
+    KVCacheOffloadManager manager(make_layout(), config, "CPU");
+    EXPECT_TRUE(manager.get_recovered_entries().empty());
+}
+
+TEST(TestKVCacheOffloadManager, RemovePersistedCacheOnEmptyDirectoryIsNoOp) {
+    const auto directory = std::filesystem::temp_directory_path() / "ov_genai_offload_remove_noop_dir";
+    std::filesystem::create_directories(directory);
+
+    EXPECT_NO_THROW(KVCacheOffloadManager::remove_persisted_cache(directory));
 
     std::filesystem::remove_all(directory);
 }

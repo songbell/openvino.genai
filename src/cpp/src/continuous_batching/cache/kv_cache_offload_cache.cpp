@@ -49,6 +49,16 @@ KVCacheOffloadCache::KVCacheOffloadCache(KVCacheManager& cache_manager,
                     "KV cache offload buffer_slots must not exceed ", CACHE_OFFLOAD_MAX_BUFFER_SLOTS);
     OPENVINO_ASSERT(m_backend->get_slot_size() == m_cache_manager.get_block_layout().get_slot_size(),
                     "KV cache offload backend slot size does not match the cache block layout");
+    // Entries recovered from a compatible persisted cache are already on disk and occupy their slots;
+    // seed the in-memory index with them before starting the writer so a lookup can hit them right away.
+    // Recovery does not preserve original insertion order, so recovered entries are simply appended in
+    // whatever order the backend returned them; they age out through the same LRU as any other entry.
+    for (const auto& recovered : m_backend->get_recovered_entries()) {
+        const std::size_t hash = recovered.first;
+        const std::size_t slot_id = recovered.second;
+        m_insertion_order.push_back(hash);
+        m_entries[hash] = Entry{slot_id, std::prev(m_insertion_order.end())};
+    }
     m_writer = std::thread(&KVCacheOffloadCache::run_writer, this);
 }
 
@@ -182,7 +192,7 @@ void KVCacheOffloadCache::run_writer() {
         lock.unlock();
         const auto started = std::chrono::steady_clock::now();
         try {
-            m_backend->write_slot(slot_id, front.data);
+            m_backend->write_slot(slot_id, front.data, hash);
         } catch (const std::exception& error) {
             GENAI_WARN("KV cache offload store failed for hash %zu: %s", hash, error.what());
             stored = false;

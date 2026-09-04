@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "continuous_batching/cache/kv_cache_disk_layout.hpp"
@@ -53,25 +54,63 @@ public:
 
     void release_slot(std::size_t slot_id);
 
-    void write_slot(std::size_t slot_id, const std::vector<uint8_t>& block_data);
+    /**
+     * @brief Writes one slot's data, computing and recording its integrity checksum.
+     * @param hash The prefix-cache hash this slot's contents belong to. Only used to persist the slot
+     * index when persistence is enabled (see `CacheOffloadConfig::enable_persistence`); the manager itself
+     * never uses it for any eviction or lookup decision. Omit it to leave the slot absent from the
+     * persisted index (it will simply not be recoverable after a restart).
+     */
+    void write_slot(std::size_t slot_id, const std::vector<uint8_t>& block_data, std::optional<std::size_t> hash = std::nullopt);
 
+    /**
+     * @brief Reads one slot's data and verifies it against the checksum recorded by write_slot() (or, for
+     * a slot recovered from a persisted cache, the checksum stored in the on-disk index).
+     * @throws ov::Exception if the checksum does not match, so a caller already treating I/O errors as a
+     * miss (recomputing instead of trusting corrupted bytes) gets the same safe behavior here.
+     */
     void read_slot(std::size_t slot_id, std::vector<uint8_t>& block_data) const;
 
     const std::filesystem::path& get_file_path() const {
         return m_file_path;
     }
 
+    /// @return (hash, slot_id) pairs recovered from a compatible persisted cache at construction time.
+    /// Empty when persistence is disabled, this is the first run for this directory, or the persisted
+    /// cache was incompatible (see CacheOffloadConfig::enable_persistence) and was therefore rebuilt fresh.
+    const std::vector<std::pair<std::size_t, std::size_t>>& get_recovered_entries() const {
+        return m_recovered_entries;
+    }
+
+    /// Deletes a persisted cache's files from @p directory, if present. Safe to call on a directory with
+    /// no persisted cache (no-op). Intended for explicit cleanup tooling, not called automatically.
+    static void remove_persisted_cache(const std::filesystem::path& directory);
+
 private:
-    void write_at(std::size_t offset, const uint8_t* data, std::size_t size) const;
-    void read_at(std::size_t offset, uint8_t* data, std::size_t size) const;
+    void write_at(int fd, std::size_t offset, const uint8_t* data, std::size_t size) const;
+    void read_at(int fd, std::size_t offset, uint8_t* data, std::size_t size) const;
     void close_and_remove() noexcept;
+
+    /// Tries to reuse an existing persisted cache in `m_file_path`/`m_manifest_path`; returns false (and
+    /// leaves both files untouched for create_fresh_persisted_files() to overwrite) if either is missing,
+    /// unreadable, or incompatible with this run's expected header.
+    bool try_recover_persisted_cache(const CacheOffloadConfig& config);
+    void create_fresh_persisted_files(const CacheOffloadConfig& config);
+    void write_manifest_record(std::size_t slot_id, std::size_t hash, std::uint64_t checksum);
 
     KVCacheDiskLayout m_layout;
     std::filesystem::path m_file_path;
+    std::filesystem::path m_manifest_path;
     int m_fd = -1;
+    int m_manifest_fd = -1;
+    bool m_persistent = false;
     std::size_t m_slot_size = 0;
     std::size_t m_num_slots = 0;
     std::vector<std::size_t> m_free_slots;
+    // Checksum of each slot's last-written contents, in-memory regardless of persistence, so read_slot()
+    // can always detect corruption; populated by write_slot() or, for a recovered slot, at construction.
+    std::vector<std::uint64_t> m_slot_checksums;
+    std::vector<std::pair<std::size_t, std::size_t>> m_recovered_entries;
     // Serializes slot bookkeeping and the seek/read/write pairs used on platforms without positional I/O.
     mutable std::mutex m_mutex;
 };

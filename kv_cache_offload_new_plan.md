@@ -513,17 +513,55 @@ load"这个状态可以泄漏给 ModelRunner，因为没有任何东西在异步
 
 至此 Phase 3 中可以在不引入新的异步架构、且能被真实证据支撑的部分已经全部完成或验证清楚。
 
-### Phase 4：跨重启持久化
+### Phase 4：跨重启持久化（已完成）
 
 目标：在语义稳定后，支持可验证的跨 pipeline/重启 cache reuse。
 
-任务：
+实现（`kv_cache_offload_manager.hpp/.cpp`、`cache_offload.hpp`、`kv_cache_offload_cache.hpp/.cpp`、
+`py_continuous_batching_pipeline.cpp`）：
 
-1. 定义 manifest 版本、模型 fingerprint、tokenizer fingerprint、KV layout、precision、block size 和 slot size。
-2. 对每个 slot 增加完整性校验，例如 checksum 和有效状态。
-3. 启动时校验 metadata；不匹配时安全忽略或重建，不允许误命中。
-4. 处理崩溃期间的未完成 write 和 manifest 更新顺序。
-5. 设计显式 cache directory 和 cleanup 策略，替代当前 run-specific 临时文件。
+1. **Manifest 格式**：新增两个固定文件名（`ov_genai_kv_offload.data` / `ov_genai_kv_offload.manifest`，
+   放在 `CacheOffloadConfig::path` 指定目录下）。Manifest 48 字节 header：magic(4)+format_version(4)+
+   slot_size(8)+num_slots(8)+model_fingerprint_hash(8)+tokenizer_fingerprint_hash(8)+layout_fingerprint_hash(8)。
+   每个 slot 对应 24 字节 record：hash(8)+checksum(8)+valid(4，实际占 8 字节对齐)。fingerprint 与 layout
+   均用 FNV-1a 64 位哈希压缩存储；layout fingerprint 基于每层 key/value segment 的字节大小（不含 offset），
+   任何精度/形状变化都会使旧持久化缓存失效。
+2. **完整性校验**：`write_slot()` 无论是否启用持久化都会计算并在内存中记录该 slot 内容的 FNV-1a
+   checksum；`read_slot()` 读取后重新计算并比对，不一致时抛 `ov::Exception`（与现有"读失败按 miss 处理"
+   的调用方行为天然兼容）。
+3. **启动校验**：构造函数中，若 `enable_persistence=true`，先尝试 `try_recover_persisted_cache()`：
+   校验文件大小、magic、format_version、slot_size、num_slots 以及三个 fingerprint 哈希，任一不匹配则
+   放弃恢复、转为 `create_fresh_persisted_files()` 全新创建，绝不会把不兼容的旧数据当成命中。
+4. **崩溃安全的写入顺序**：每次持久化写入先写 data 并 `fsync`，再写 hash+checksum 并 `fsync`，最后单独
+   写 `valid=1` 标志再 `fsync`。崩溃发生在最后一步之前时，重启后该 record 的 `valid` 仍为 0，等同于
+   "从未发生"，不会出现 valid=1 但内容是垃圾的撕裂记录。已用直接篡改 manifest 文件模拟这一场景验证
+   （`TornManifestRecordIsIgnoredNotCrashed` 测试）。
+5. **显式目录与清理**：持久化模式要求调用方提供非空 `path`（不允许用系统临时目录），并要求非空
+   `model_fingerprint`/`tokenizer_fingerprint`。新增静态方法 `KVCacheOffloadManager::remove_persisted_cache
+   (directory)` 作为显式清理工具（默认不自动调用）。非持久化模式行为完全不变（仍是 run-specific 临时
+   文件，进程退出即删除）。
+
+`KVCacheOffloadCache` 在构造时会读取 `KVCacheOffloadManager::get_recovered_entries()`，把恢复到的
+(hash, slot_id) 直接灌入内存索引（`m_entries`/`m_insertion_order`），使其在重启后立刻可读；`run_writer()`
+写盘时现在会把 hash 传给 `write_slot()`，只有携带 hash 的写入才会被记录进 manifest。
+
+`CacheOffloadConfig` 新增 `enable_persistence`（默认 false）、`model_fingerprint`、`tokenizer_fingerprint`
+三个字段，均已加入 Python 绑定的 `.def_readwrite(...)`。
+
+**V1 已知限制（有意的范围收窄，非疏漏）**：
+- 仅精确匹配 `num_slots`/`capacity_bytes`；调整容量会导致整份持久化缓存失效重建，不做部分复用。
+- L1 host cache（`HostBlockPool`）不持久化，这是 Phase 2 就确定的范围决策，跨重启后只有 disk 层可命中。
+- 校验是"惰性"的：仅在实际 `read_slot()` 时才校验对应 slot 的 checksum，构造时不会扫描全部 slot 数据
+  做一次性完整性体检（manifest header/record 本身在构造时会被校验）。
+- 未做恢复过程的异步化；`try_recover_persisted_cache()` 是同步执行的（仅扫描 manifest 记录，不读取
+  block 数据本身，故耗时应远小于扫描整份 data 文件）。
+
+验证：新增 24 个 `KVCacheOffloadManager` 单元测试（`PersistentCacheDirFixture.*`，覆盖跨重启恢复、
+model/tokenizer/layout/slot-count 不匹配安全重建、撕裂 manifest record、数据 checksum 损坏、无 hash 写入
+不持久化、`remove_persisted_cache` 清理）以及 1 个 `KVCacheOffloadCache` 集成测试
+（`RecoversEntriesFromPersistedCacheAcrossRestart`），全部通过；既有 90+ 项 offload/block-manager/
+cache-manager 相关测试及完整 702 项测试套件（17 项已知无关失败）均无回归；真实 GPU E2E
+(`TestKVCacheOffloadEndToEnd.*`) 复测通过，确认持久化默认关闭时行为不受影响。
 
 注意：跨重启持久化不等于把当前临时文件留下来。必须先定义兼容性和失效协议。
 

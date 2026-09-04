@@ -482,6 +482,9 @@ void init_continuous_batching_pipeline(py::module_& m) {
             .def_readwrite("enable_detailed_logging", &CacheOffloadConfig::enable_detailed_logging)
             .def_readwrite("use_page_cache", &CacheOffloadConfig::use_page_cache)
             .def_readwrite("host_cache_slots", &CacheOffloadConfig::host_cache_slots)
+            .def_readwrite("enable_persistence", &CacheOffloadConfig::enable_persistence)
+            .def_readwrite("model_fingerprint", &CacheOffloadConfig::model_fingerprint)
+            .def_readwrite("tokenizer_fingerprint", &CacheOffloadConfig::tokenizer_fingerprint)
             .def("to_string", &CacheOffloadConfig::to_string);
 
     py::class_<SchedulerConfig>(m, "SchedulerConfig", scheduler_config_docstring)

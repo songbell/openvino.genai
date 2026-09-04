@@ -684,3 +684,42 @@ TEST(TestKVCacheOffloadCache, HandlesCopyOnWriteOfSharedBlock) {
     block_manager.free_sequence(first->get_running_sequences().at(0)->get_id());
     block_manager.free_sequence(second->get_running_sequences().at(0)->get_id());
 }
+
+TEST(TestKVCacheOffloadCache, RecoversEntriesFromPersistedCacheAcrossRestart) {
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("ov_genai_offload_cache_persist_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+    std::filesystem::create_directories(directory);
+
+    CacheFixture fixture;
+    CacheOffloadConfig config = make_offload_config(fixture, /*num_slots=*/2);
+    config.path = directory.string();
+    config.enable_persistence = true;
+    config.model_fingerprint = "model-x";
+    config.tokenizer_fingerprint = "tokenizer-x";
+
+    const auto expected = fixture.fill_block(0, /*seed=*/3);
+    {
+        auto backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(), config, "CPU");
+        KVCacheOffloadCache offload_cache(*fixture.cache_manager, std::move(backend), /*max_queued_stores=*/8);
+        offload_cache.on_blocks_overwritten(/*hash=*/21, make_block_set(0));
+        offload_cache.flush();
+        EXPECT_EQ(offload_cache.get_num_entries(), 1);
+        // offload_cache and its backend destruct here; the persisted files must survive.
+    }
+
+    auto reopened_backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(), config, "CPU");
+    ASSERT_EQ(reopened_backend->get_recovered_entries().size(), 1u);
+    {
+        KVCacheOffloadCache reopened_cache(*fixture.cache_manager, std::move(reopened_backend), /*max_queued_stores=*/8);
+
+        EXPECT_EQ(reopened_cache.get_num_entries(), 1u);
+        const auto location = reopened_cache.get_location(/*hash=*/21);
+        EXPECT_TRUE(location.disk_resident);
+
+        std::vector<uint8_t> actual;
+        EXPECT_TRUE(reopened_cache.read(/*hash=*/21, actual));
+        EXPECT_EQ(actual, expected);
+    }
+
+    std::filesystem::remove_all(directory);
+}

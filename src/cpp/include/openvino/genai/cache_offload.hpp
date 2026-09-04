@@ -43,11 +43,31 @@ struct CacheOffloadConfig {
      */
     std::size_t host_cache_slots = 0;
 
+    /**
+     * Whether the offload file and its slot index survive process exit, to be reused by a later run
+     * instead of being deleted when this run ends. Requires a non-empty `path` (an explicit, stable
+     * directory - the system temporary directory is not appropriate for data meant to outlive the run)
+     * and non-empty `model_fingerprint` / `tokenizer_fingerprint`.
+     */
+    bool enable_persistence = false;
+
+    /**
+     * Caller-supplied identity for the model (including precision/shape choices that affect the KV cache
+     * layout) backing this cache. Only used when `enable_persistence` is true: an existing persisted cache
+     * is reused only when this matches what was stored with it, so a leftover cache from a different model
+     * is never misread as valid for the current one.
+     */
+    std::string model_fingerprint;
+
+    /** Caller-supplied identity for the tokenizer, checked the same way as `model_fingerprint`. */
+    std::string tokenizer_fingerprint;
+
     bool operator==(const CacheOffloadConfig& other) const {
         return path == other.path && capacity_bytes == other.capacity_bytes &&
              buffer_slots == other.buffer_slots && wait_for_buffer == other.wait_for_buffer &&
              enable_detailed_logging == other.enable_detailed_logging && use_page_cache == other.use_page_cache &&
-             host_cache_slots == other.host_cache_slots;
+             host_cache_slots == other.host_cache_slots && enable_persistence == other.enable_persistence &&
+             model_fingerprint == other.model_fingerprint && tokenizer_fingerprint == other.tokenizer_fingerprint;
     }
 
     std::string to_string() const {
@@ -60,6 +80,9 @@ struct CacheOffloadConfig {
         oss << "    enable_detailed_logging: " << std::boolalpha << enable_detailed_logging << "\n";
         oss << "    use_page_cache: " << std::boolalpha << use_page_cache << "\n";
         oss << "    host_cache_slots: " << host_cache_slots << "\n";
+        oss << "    enable_persistence: " << std::boolalpha << enable_persistence << "\n";
+        oss << "    model_fingerprint: " << model_fingerprint << "\n";
+        oss << "    tokenizer_fingerprint: " << tokenizer_fingerprint << "\n";
         oss << "  }";
         return oss.str();
     }
