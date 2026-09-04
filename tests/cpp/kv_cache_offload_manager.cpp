@@ -48,6 +48,15 @@ TEST(TestKVCacheOffloadManager, DerivesSlotCountFromCapacity) {
     EXPECT_EQ(manager.get_num_free_slots(), 4);
 }
 
+TEST(TestKVCacheOffloadManager, DescribesBufferBudgetAndDefaults) {
+    CacheOffloadConfig config;
+
+    EXPECT_EQ(config.buffer_slots, 2);
+    EXPECT_TRUE(config.to_string().find("buffer_slots: 2") != std::string::npos);
+    EXPECT_TRUE(config.to_string().find("wait_for_buffer: false") != std::string::npos);
+    EXPECT_TRUE(config.to_string().find("enable_detailed_logging: false") != std::string::npos);
+}
+
 TEST(TestKVCacheOffloadManager, CreatesAndRemovesRunSpecificFile) {
     std::filesystem::path file_path;
     {

@@ -359,6 +359,11 @@ per-layer 拒绝、overwrite store、disk warm、warm chain 保持、partial rel
 
 目标：先知道瓶颈在哪里，再决定是否引入复杂的数据路径。
 
+施工状态：已开始实现。当前配置支持队列满时的 drop 或等待策略，统计已覆盖队列峰值、staging/disk/miss
+来源和 store/load 分阶段耗时；逐 block trace 默认关闭，可通过配置显式开启。Phase 1 尚未完成的部分是
+完整的性能报告，以及更全面的 backpressure 和异常路径测试。当前 `buffer_slots` 默认值为 2，上限为 1024；
+每个 slot 持有一个完整 KV block snapshot，因此 staging 内存预算约为 `buffer_slots * slot_size`。
+
 任务：
 
 1. 分开统计 device-to-host、host-to-file、file-to-host、host-to-device 时间。

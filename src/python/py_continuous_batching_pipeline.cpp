@@ -315,7 +315,12 @@ void init_continuous_batching_pipeline(py::module_& m) {
     py::class_<GenerationResult>(m, "GenerationResult", generation_result_docstring)
         .def(py::init<>())
         .def_readonly("m_request_id", &GenerationResult::m_request_id)
-        .def_property("m_generation_ids",
+                CacheOffloadConfig config;
+                config.path = path;
+                config.capacity_bytes = capacity_bytes;
+                config.buffer_slots = buffer_slots;
+                config.use_page_cache = use_page_cache;
+                return config; }),
             [](GenerationResult &r) -> py::typing::List<py::str> {
                 return pyutils::handle_utf8(r.m_generation_ids);
             },
@@ -473,6 +478,8 @@ void init_continuous_batching_pipeline(py::module_& m) {
             .def_readwrite("path", &CacheOffloadConfig::path)
             .def_readwrite("capacity_bytes", &CacheOffloadConfig::capacity_bytes)
             .def_readwrite("buffer_slots", &CacheOffloadConfig::buffer_slots)
+            .def_readwrite("wait_for_buffer", &CacheOffloadConfig::wait_for_buffer)
+            .def_readwrite("enable_detailed_logging", &CacheOffloadConfig::enable_detailed_logging)
             .def_readwrite("use_page_cache", &CacheOffloadConfig::use_page_cache)
             .def("to_string", &CacheOffloadConfig::to_string);
 

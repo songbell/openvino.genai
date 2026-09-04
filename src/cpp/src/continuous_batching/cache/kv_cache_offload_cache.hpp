@@ -42,6 +42,10 @@ public:
         std::size_t num_loaded = 0;
         std::size_t num_failed = 0;
         std::size_t num_dropped_no_buffer = 0;
+        std::size_t num_queue_peak = 0;
+        std::size_t num_load_staging = 0;
+        std::size_t num_load_disk = 0;
+        std::size_t num_load_misses = 0;
         // TEMPORARY diagnostics, to be removed once the GPU cost breakdown is settled.
         std::size_t store_read_us = 0;
         std::size_t store_write_us = 0;
@@ -69,7 +73,9 @@ public:
 
     KVCacheOffloadCache(KVCacheManager& cache_manager,
                         std::unique_ptr<KVCacheOffloadManager> backend,
-                        std::size_t max_queued_stores = 2);
+                        std::size_t max_queued_stores = 2,
+                        bool wait_for_buffer = false,
+                        bool enable_detailed_logging = false);
     ~KVCacheOffloadCache();
 
     void on_blocks_overwritten(std::size_t hash, const BlocksPerLayer& blocks) override;
@@ -126,6 +132,8 @@ private:
     // A store stays queued until it is published, so readers never lose sight of it.
     std::deque<QueuedStore> m_queued_stores;
     std::size_t m_max_queued_stores;
+    bool m_wait_for_buffer;
+    bool m_enable_detailed_logging;
     std::vector<uint8_t> m_staging;
     Statistics m_statistics;
     bool m_reclamation_paused = false;

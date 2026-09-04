@@ -84,10 +84,23 @@ TEST(TestKVCacheOffloadCache, StoresBlockContentsOnOverwrite) {
     EXPECT_TRUE(offload_cache->contains(42));
     EXPECT_EQ(offload_cache->get_num_entries(), 1);
     EXPECT_EQ(offload_cache->get_statistics().num_stored, 1);
+    EXPECT_EQ(offload_cache->get_statistics().num_queue_peak, 1);
 
     std::vector<uint8_t> restored;
     ASSERT_TRUE(offload_cache->read(42, restored));
     EXPECT_EQ(restored, expected);
+}
+
+TEST(TestKVCacheOffloadCache, RejectsExcessiveBufferSlots) {
+    CacheFixture fixture;
+    auto backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(),
+                                                           make_offload_config(fixture, 1),
+                                                           "CPU");
+
+    EXPECT_THROW(KVCacheOffloadCache(*fixture.cache_manager,
+                                     std::move(backend),
+                                     CACHE_OFFLOAD_MAX_BUFFER_SLOTS + 1),
+                 ov::Exception);
 }
 
 TEST(TestKVCacheOffloadCache, KeepsFirstCopyOfKnownHash) {
@@ -248,6 +261,7 @@ TEST(TestKVCacheOffloadCache, LoadsStoredContentsIntoAnotherBlock) {
 
     EXPECT_EQ(fixture.cache_manager->read_block(2), expected);
     EXPECT_EQ(offload_cache->get_statistics().num_loaded, 1);
+    EXPECT_EQ(offload_cache->get_statistics().num_load_disk, 1);
 }
 
 TEST(TestKVCacheOffloadCache, LoadReportsMissForUnknownHash) {
@@ -257,6 +271,7 @@ TEST(TestKVCacheOffloadCache, LoadReportsMissForUnknownHash) {
 
     EXPECT_FALSE(offload_cache->load_into(/*hash=*/12345, /*block_index=*/1));
     EXPECT_EQ(fixture.cache_manager->read_block(1), untouched);
+    EXPECT_EQ(offload_cache->get_statistics().num_load_misses, 1);
 }
 
 TEST(TestKVCacheOffloadCache, WarmPrefixCacheRestoresBlocksFromDisk) {
@@ -401,6 +416,9 @@ TEST(TestKVCacheOffloadCache, ServesStoredBlockWhileTheWriteIsStillQueued) {
     fixture.fill_block(3, /*seed=*/0);
     ASSERT_TRUE(offload_cache->load_into(/*hash=*/64, /*block_index=*/3));
     EXPECT_EQ(fixture.cache_manager->read_block(3), expected);
+    // The background writer may have already published by the time load_into runs, so the hit can
+    // legitimately land on either source; only their sum is deterministic.
+    EXPECT_EQ(offload_cache->get_statistics().num_load_staging + offload_cache->get_statistics().num_load_disk, 1);
 
     offload_cache->flush();
     EXPECT_EQ(offload_cache->get_num_entries(), 1);

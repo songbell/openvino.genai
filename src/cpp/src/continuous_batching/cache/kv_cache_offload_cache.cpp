@@ -3,6 +3,7 @@
 
 #include "continuous_batching/cache/kv_cache_offload_cache.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -32,12 +33,18 @@ private:
 
 KVCacheOffloadCache::KVCacheOffloadCache(KVCacheManager& cache_manager,
                                          std::unique_ptr<KVCacheOffloadManager> backend,
-                                         std::size_t max_queued_stores)
+                                                                                 std::size_t max_queued_stores,
+                                                                                 bool wait_for_buffer,
+                                                                                 bool enable_detailed_logging)
     : m_cache_manager(cache_manager),
       m_backend(std::move(backend)),
-      m_max_queued_stores(max_queued_stores) {
+            m_max_queued_stores(max_queued_stores),
+            m_wait_for_buffer(wait_for_buffer),
+            m_enable_detailed_logging(enable_detailed_logging) {
     OPENVINO_ASSERT(m_backend != nullptr, "KV cache offload backend must not be null");
     OPENVINO_ASSERT(m_max_queued_stores > 0, "KV cache offload needs at least one staging buffer");
+    OPENVINO_ASSERT(m_max_queued_stores <= CACHE_OFFLOAD_MAX_BUFFER_SLOTS,
+                    "KV cache offload buffer_slots must not exceed ", CACHE_OFFLOAD_MAX_BUFFER_SLOTS);
     OPENVINO_ASSERT(m_backend->get_slot_size() == m_cache_manager.get_block_layout().get_slot_size(),
                     "KV cache offload backend slot size does not match the cache block layout");
     m_writer = std::thread(&KVCacheOffloadCache::run_writer, this);
@@ -53,10 +60,18 @@ KVCacheOffloadCache::~KVCacheOffloadCache() {
         m_writer.join();
     }
     // TEMPORARY diagnostics, to be removed once the GPU cost breakdown is settled.
-    GENAI_INFO("[KV_TRACE] offload_cost stored=%zu loaded=%zu store_read=%zu us store_write=%zu us "
-               "load_disk=%zu us load_write=%zu us",
+    GENAI_INFO("[KV_TRACE] offload_stats stored=%zu replaced=%zu loaded=%zu failed=%zu dropped=%zu "
+               "queue_peak=%zu load_staging=%zu load_disk=%zu load_miss=%zu "
+               "store_read=%zu us store_write=%zu us load_disk_time=%zu us load_write=%zu us",
                m_statistics.num_stored,
+               m_statistics.num_replaced,
                m_statistics.num_loaded,
+               m_statistics.num_failed,
+               m_statistics.num_dropped_no_buffer,
+               m_statistics.num_queue_peak,
+               m_statistics.num_load_staging,
+               m_statistics.num_load_disk,
+               m_statistics.num_load_misses,
                m_statistics.store_read_us,
                m_statistics.store_write_us,
                m_statistics.load_disk_us,
@@ -73,7 +88,7 @@ void KVCacheOffloadCache::on_blocks_overwritten(std::size_t hash, const BlocksPe
     const auto block_index = blocks.front()->get_index();
     OPENVINO_ASSERT(block_index >= 0, "Invalid physical block index ", block_index);
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    std::unique_lock<std::mutex> lock(m_mutex);
 
     if (m_entries.find(hash) != m_entries.end() || find_queued(hash) != nullptr) {
         // Contents are content-addressed by `hash`, so the stored copy already holds the same data.
@@ -81,8 +96,15 @@ void KVCacheOffloadCache::on_blocks_overwritten(std::size_t hash, const BlocksPe
         return;
     }
 
-    if (m_queued_stores.size() >= m_max_queued_stores) {
-        // Waiting here would stall block allocation, and a missing entry only costs recomputation.
+    if (m_wait_for_buffer) {
+        m_drained_cv.wait(lock, [this] {
+            return m_stopping || m_queued_stores.size() < m_max_queued_stores;
+        });
+        if (m_stopping) {
+            ++m_statistics.num_failed;
+            return;
+        }
+    } else if (m_queued_stores.size() >= m_max_queued_stores) {
         ++m_statistics.num_dropped_no_buffer;
         return;
     }
@@ -118,10 +140,13 @@ void KVCacheOffloadCache::on_blocks_overwritten(std::size_t hash, const BlocksPe
     }
 
     m_queued_stores.push_back(std::move(queued));
-    GENAI_INFO("[KV_TRACE] KVCacheOffloadCache queue_store hash=%zu physical_block=%d queued=%zu",
-               hash,
-               block_index,
-               m_queued_stores.size());
+    m_statistics.num_queue_peak = std::max(m_statistics.num_queue_peak, m_queued_stores.size());
+    if (m_enable_detailed_logging) {
+        GENAI_INFO("[KV_TRACE] KVCacheOffloadCache queue_store hash=%zu physical_block=%d queued=%zu",
+                   hash,
+                   block_index,
+                   m_queued_stores.size());
+    }
     m_queued_cv.notify_one();
 }
 
@@ -145,14 +170,17 @@ void KVCacheOffloadCache::run_writer() {
 
         bool stored = true;
         lock.unlock();
+        const auto started = std::chrono::steady_clock::now();
         try {
-            ScopedTimer timer(m_statistics.store_write_us);
             m_backend->write_slot(slot_id, front.data);
         } catch (const std::exception& error) {
             GENAI_WARN("KV cache offload store failed for hash %zu: %s", hash, error.what());
             stored = false;
         }
+        const auto elapsed_us = static_cast<std::size_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
         lock.lock();
+        m_statistics.store_write_us += elapsed_us;
 
         m_queued_stores.pop_front();
         if (stored) {
@@ -172,11 +200,13 @@ void KVCacheOffloadCache::publish(std::size_t hash, std::size_t slot_id, bool re
     if (reclaimed) {
         ++m_statistics.num_replaced;
     }
-    GENAI_INFO("[KV_TRACE] KVCacheOffloadCache publish hash=%zu slot=%zu entries=%zu replaced=%s",
-               hash,
-               slot_id,
-               m_entries.size(),
-               reclaimed ? "true" : "false");
+    if (m_enable_detailed_logging) {
+        GENAI_INFO("[KV_TRACE] KVCacheOffloadCache publish hash=%zu slot=%zu entries=%zu replaced=%s",
+                   hash,
+                   slot_id,
+                   m_entries.size(),
+                   reclaimed ? "true" : "false");
+    }
 }
 
 void KVCacheOffloadCache::flush() {
@@ -227,20 +257,27 @@ bool KVCacheOffloadCache::load_into(std::size_t hash, std::size_t block_index) {
     try {
         if (const QueuedStore* queued = find_queued(hash)) {
             // Still on its way to disk, so the staging copy is the closest source.
-            GENAI_INFO("[KV_TRACE] KVCacheOffloadCache load hash=%zu source=staging physical_block=%zu",
-                       hash,
-                       block_index);
+            ++m_statistics.num_load_staging;
+            if (m_enable_detailed_logging) {
+                GENAI_INFO("[KV_TRACE] KVCacheOffloadCache load hash=%zu source=staging physical_block=%zu",
+                           hash,
+                           block_index);
+            }
             ScopedTimer timer(m_statistics.load_write_us);
             m_cache_manager.write_block(block_index, queued->data);
         } else {
             auto it = m_entries.find(hash);
             if (it == m_entries.end()) {
+                ++m_statistics.num_load_misses;
                 return false;
             }
-            GENAI_INFO("[KV_TRACE] KVCacheOffloadCache load hash=%zu source=disk slot=%zu physical_block=%zu",
-                       hash,
-                       it->second.slot_id,
-                       block_index);
+            ++m_statistics.num_load_disk;
+            if (m_enable_detailed_logging) {
+                GENAI_INFO("[KV_TRACE] KVCacheOffloadCache load hash=%zu source=disk slot=%zu physical_block=%zu",
+                           hash,
+                           it->second.slot_id,
+                           block_index);
+            }
             {
                 ScopedTimer timer(m_statistics.load_disk_us);
                 m_backend->read_slot(it->second.slot_id, m_staging);
@@ -255,8 +292,9 @@ bool KVCacheOffloadCache::load_into(std::size_t hash, std::size_t block_index) {
     }
 
     ++m_statistics.num_loaded;
-    // TEMPORARY diagnostics, to be removed once the GPU cost breakdown is settled.
-    GENAI_INFO("[KV_TRACE] offload_load_block index=%zu", block_index);
+    if (m_enable_detailed_logging) {
+        GENAI_INFO("[KV_TRACE] offload_load_block index=%zu", block_index);
+    }
     return true;
 }
 

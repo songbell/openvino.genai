@@ -125,7 +125,9 @@ public:
 
         m_kv_offload_cache = std::make_unique<KVCacheOffloadCache>(kv_manager,
                                                                    std::move(backend),
-                                                                   offload_config.buffer_slots);
+                                                                   offload_config.buffer_slots,
+                                                                   offload_config.wait_for_buffer,
+                                                                   offload_config.enable_detailed_logging);
         m_block_managers.at(CacheType::KV_CACHE)->set_overwritten_block_observer(m_kv_offload_cache.get());
     }
 
