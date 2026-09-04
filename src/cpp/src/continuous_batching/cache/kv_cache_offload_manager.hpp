@@ -26,9 +26,16 @@ namespace ov::genai {
  */
 class KVCacheOffloadManager {
 public:
+    /**
+     * @param tenant_isolation_seed Recorded in the persisted manifest header (has no effect when
+     * persistence is disabled). A persisted cache is only ever recovered when this matches the seed it
+     * was written with, so a cache belonging to a different tenant/cache_salt (see
+     * compute_prefix_isolation_seed()) is always rejected and rebuilt fresh rather than partially reused.
+     */
     KVCacheOffloadManager(const KVCacheDiskLayout& layout,
                           const CacheOffloadConfig& config,
-                          const std::string& device);
+                          const std::string& device,
+                          uint64_t tenant_isolation_seed = 0);
     ~KVCacheOffloadManager();
 
     KVCacheOffloadManager(const KVCacheOffloadManager&) = delete;
@@ -106,6 +113,9 @@ private:
     bool m_persistent = false;
     std::size_t m_slot_size = 0;
     std::size_t m_num_slots = 0;
+    // 0 means no tenant isolation was configured; recorded in the persisted manifest header and checked
+    // on recovery so a cache from a different tenant/cache_salt is never partially reused.
+    std::uint64_t m_tenant_isolation_seed = 0;
     std::vector<std::size_t> m_free_slots;
     // Checksum of each slot's last-written contents, in-memory regardless of persistence, so read_slot()
     // can always detect corruption; populated by write_slot() or, for a recovered slot, at construction.

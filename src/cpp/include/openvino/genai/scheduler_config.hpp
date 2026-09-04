@@ -7,6 +7,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <string>
 
 #include "openvino/genai/cache_eviction.hpp"
 #include "openvino/genai/cache_offload.hpp"
@@ -99,6 +100,24 @@ struct SchedulerConfig {
      */
     CacheOffloadConfig cache_offload_config;
 
+    /**
+     * Caller-supplied tenant identity mixed into every prefix-cache block hash (in memory and, when disk
+     * offload persistence is enabled, in the persisted manifest), so two pipelines serving different
+     * tenants but sharing the same model and token content can never compute the same hash and can never
+     * observe each other's cached KV blocks. Left empty by default: two pipelines that both leave
+     * `tenant_id` and `cache_salt` empty are treated as the same (default) tenant, which is only safe for
+     * single-tenant deployments - this is an explicit, documented default, not partial isolation.
+     */
+    std::string tenant_id;
+
+    /**
+     * Optional additional value mixed into the hash alongside `tenant_id`, for callers that want isolation
+     * between sessions of the same tenant (e.g. a per-user or per-session secret) without introducing a
+     * new tenant identity for every session. Treated the same as `tenant_id`: non-empty always changes the
+     * hash namespace, empty (with an empty `tenant_id`) means no isolation.
+     */
+    std::string cache_salt;
+
     std::size_t get_cache_interval(std::size_t kv_block_size) const {
         const std::size_t effective_cache_interval_multiplier =
             cache_interval_multiplier.value_or(DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL_MULTIPLIER);
@@ -130,7 +149,8 @@ struct SchedulerConfig {
                dynamic_split_fuse == other.dynamic_split_fuse && use_cache_eviction == other.use_cache_eviction &&
                max_num_seqs == other.max_num_seqs && enable_prefix_caching == other.enable_prefix_caching &&
                cache_interval_multiplier == other.cache_interval_multiplier &&
-               use_cache_offload == other.use_cache_offload && cache_offload_config == other.cache_offload_config;
+               use_cache_offload == other.use_cache_offload && cache_offload_config == other.cache_offload_config &&
+               tenant_id == other.tenant_id && cache_salt == other.cache_salt;
     }
 
     /**
@@ -167,6 +187,8 @@ struct SchedulerConfig {
         if (use_cache_offload) {
             oss << cache_offload_config.to_string() << "\n";
         }
+        oss << "  tenant_id: " << (tenant_id.empty() ? std::string("<none>") : tenant_id) << "\n";
+        oss << "  cache_salt: " << (cache_salt.empty() ? "<none>" : "<redacted, set>") << "\n";
         oss << " }";
         return oss.str();
     }

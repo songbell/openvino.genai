@@ -565,16 +565,50 @@ cache-manager 相关测试及完整 702 项测试套件（17 项已知无关失�
 
 注意：跨重启持久化不等于把当前临时文件留下来。必须先定义兼容性和失效协议。
 
-### Phase 5：安全隔离
+### Phase 5：安全隔离（已完成）
 
 目标：在持久化格式稳定后，先建立 prefix cache 的安全边界。
 
-任务：
+实现（`kv_cache_isolation_seed.hpp`、`scheduler_config.hpp`、`block_manager.hpp`、`cache_orchestrator.hpp`、
+`kv_cache_offload_manager.hpp/.cpp`、`py_continuous_batching_pipeline.cpp`）：
 
-1. 将 `tenant_id` 和可选 `cache_salt` 纳入 prefix hash 的根种子。
-2. 明确未提供 tenant 信息时的默认策略，避免无意间跨租户或跨 session 复用。
-3. 补充跨租户、不同 salt、不同模型和不同 tokenizer 的命中隔离测试。
-4. 将隔离信息纳入持久化 metadata，metadata 不匹配时只能 miss，不能尝试恢复。
+1. **根种子**：新增 `SchedulerConfig::tenant_id`（`std::string`）和 `SchedulerConfig::cache_salt`
+   （`std::string`），均默认为空字符串。新增纯 header-only 工具函数
+   `compute_prefix_isolation_seed(tenant_id, cache_salt)`：两者都为空时返回 `0`（显式的"未配置隔离"哨兵值，
+   与旧版无隔离行为完全一致，保证单租户部署零回归）；否则用分隔符拼接后做 FNV-1a 哈希，并保证非零（即使
+   哈希结果碰巧为 0 也强制返回 1），使得"是否配置了隔离"始终可以用 `seed == 0` 无歧义判断。
+2. **默认策略**：未提供 `tenant_id`/`cache_salt` 时，root seed 为 0，`BlockManager::seeded_hash()` 在此
+   情况下直接返回 `Sequence::get_hash()` 原始值（不做任何混合），即"默认单租户、不隔离"是一个显式声明的
+   状态，而不是留空产生的意外安全边界；这一点在 `SchedulerConfig` 的字段注释和 `to_string()` 输出中都有
+   说明（`cache_salt` 的值本身不会被打印，只打印是否已设置，避免把敏感值写入日志)。
+3. **隔离生效范围**：`CacheOrchestrator::create()` 在 `register_kv_cache()`/`register_linear_attention_cache()`
+   时用 `compute_prefix_isolation_seed()` 计算一次 root seed，传给 `BlockManager` 构造函数；`BlockManager`
+   新增私有方法 `seeded_hash()`，是所有块哈希计算的唯一入口（原来分散在 10 处的 `sequence->get_hash(...)`
+   调用点已全部替换为 `seeded_hash(sequence, content_length)`），因此内存态 prefix cache 命中、
+   `KVCacheOffloadCache` 的 hash 索引、以及传给 disk backend 的 hash 参数，全部自动携带同一个 root seed，
+   无需在多处分别处理。
+4. **持久化 metadata 隔离**：`KVCacheOffloadManager` 构造函数新增 `tenant_isolation_seed`
+   参数（`CacheOrchestrator::enable_kv_cache_offload()` 同样用 `compute_prefix_isolation_seed()` 计算并传入），
+   manifest header 版本升至 2（`MANIFEST_FORMAT_VERSION=2`，header 从 48 字节增至 56 字节，新增
+   8 字节 `tenant_fp` 字段），`try_recover_persisted_cache()` 校验时把 `tenant_fp` 与当前构造时传入的
+   `tenant_isolation_seed` 做精确比较，任一不匹配则整份持久化缓存判定为不兼容、安全丢弃重建（与
+   model/tokenizer/layout fingerprint 走同一条"要么完全信任、要么整体重建"的路径，不做部分恢复）。
+   `remove_persisted_cache()` 工具不受影响（按目录删除，不关心 tenant）。
+
+验证：新增 7 个 `TestComputePrefixIsolationSeed` 单测（空输入即哨兵 0、非空必非零、确定性、不同
+tenant/salt 产生不同种子、拼接歧义不塌陷）；3 个 `TestBlockManager` 单测（默认 seed 与未隔离哈希完全一致、
+不同 tenant 对同一内容产生不同哈希、相同 tenant/salt 跨 `BlockManager` 实例产生相同哈希）；2 个
+`PersistentCacheDirFixture` 单测（tenant 不匹配安全重建、tenant 匹配跨重启正常恢复）。全部通过；既有
+98 项 offload/block-manager/cache-manager 相关测试及完整 714 项测试套件（17 项已知无关失败,与 Phase 4
+相同)均无回归；真实 GPU E2E (`TestKVCacheOffloadEndToEnd.*`) 复测通过。
+
+**V1 已知限制（有意的范围收窄）**：
+- 隔离粒度是"每个 pipeline 实例一个 tenant"，不是同一进程内按请求切换 tenant 的真正多租户复用（与
+  `model_fingerprint`/`tokenizer_fingerprint` 的粒度一致）；如果需要单进程内为不同请求使用不同 tenant，
+  需要在这之上再设计一层，当前未实现。
+- `cache_salt` 只是一个额外可选值，不是加密学意义上的密钥管理；它本身以明文形式存在于 `SchedulerConfig`
+  中，调用方需要自行保护其分发和存储方式。
+- 校验粒度是"整份缓存要么完全信任、要么整体重建"，不支持同一 disk 目录下按 tenant 分区共存多份缓存。
 
 安全隔离应先于插件公开，因为插件不能绕过 core 的 hash、tenant 和失效策略。
 

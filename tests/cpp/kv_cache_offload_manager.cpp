@@ -8,6 +8,8 @@
 #include <fstream>
 #include <numeric>
 
+#include "continuous_batching/cache/kv_cache_isolation_seed.hpp"
+
 #include "continuous_batching/cache/kv_cache_offload_manager.hpp"
 
 using namespace ov::genai;
@@ -332,7 +334,7 @@ TEST_F(PersistentCacheDirFixture, TornManifestRecordIsIgnoredNotCrashed) {
 
     // Simulate a crash between the hash/checksum write and the valid-flag write for slot 1: flip its
     // valid flag back to 0 by directly patching the manifest file.
-    constexpr std::size_t MANIFEST_HEADER_SIZE = 48;
+    constexpr std::size_t MANIFEST_HEADER_SIZE = 56;
     constexpr std::size_t MANIFEST_RECORD_SIZE = 24;
     const auto manifest_path = directory / "ov_genai_kv_offload.manifest";
     {
@@ -408,6 +410,33 @@ TEST_F(PersistentCacheDirFixture, RemovePersistedCacheDeletesFilesAndAllowsFresh
     EXPECT_TRUE(manager.get_recovered_entries().empty());
 }
 
+TEST_F(PersistentCacheDirFixture, MismatchedTenantIsolationSeedRebuildsFresh) {
+    const auto config = make_persistent_config(3, directory);
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU", /*tenant_isolation_seed=*/0);
+        manager.write_slot(0, make_pattern(11), /*hash=*/42);
+    }
+
+    // A different tenant/cache_salt combination must never recover a slot written under a different seed,
+    // even though model, tokenizer, layout and slot count all still match.
+    KVCacheOffloadManager manager(make_layout(), config, "CPU",
+                                  /*tenant_isolation_seed=*/compute_prefix_isolation_seed("tenant-a", ""));
+    EXPECT_TRUE(manager.get_recovered_entries().empty());
+}
+
+TEST_F(PersistentCacheDirFixture, SameTenantIsolationSeedRecoversAcrossRestart) {
+    const auto config = make_persistent_config(3, directory);
+    const uint64_t seed = compute_prefix_isolation_seed("tenant-a", "session-1");
+    {
+        KVCacheOffloadManager manager(make_layout(), config, "CPU", seed);
+        manager.write_slot(0, make_pattern(11), /*hash=*/42);
+    }
+
+    KVCacheOffloadManager manager(make_layout(), config, "CPU", seed);
+    ASSERT_EQ(manager.get_recovered_entries().size(), 1u);
+    EXPECT_EQ(manager.get_recovered_entries().front().first, 42u);
+}
+
 TEST(TestKVCacheOffloadManager, RemovePersistedCacheOnEmptyDirectoryIsNoOp) {
     const auto directory = std::filesystem::temp_directory_path() / "ov_genai_offload_remove_noop_dir";
     std::filesystem::create_directories(directory);
@@ -415,4 +444,33 @@ TEST(TestKVCacheOffloadManager, RemovePersistedCacheOnEmptyDirectoryIsNoOp) {
     EXPECT_NO_THROW(KVCacheOffloadManager::remove_persisted_cache(directory));
 
     std::filesystem::remove_all(directory);
+}
+
+TEST(TestComputePrefixIsolationSeed, EmptyTenantAndSaltIsTheZeroSentinel) {
+    EXPECT_EQ(compute_prefix_isolation_seed("", ""), 0u);
+}
+
+TEST(TestComputePrefixIsolationSeed, NonEmptyTenantIdIsNeverZero) {
+    EXPECT_NE(compute_prefix_isolation_seed("tenant-a", ""), 0u);
+}
+
+TEST(TestComputePrefixIsolationSeed, NonEmptyCacheSaltAloneIsNeverZero) {
+    EXPECT_NE(compute_prefix_isolation_seed("", "salt-a"), 0u);
+}
+
+TEST(TestComputePrefixIsolationSeed, IsDeterministic) {
+    EXPECT_EQ(compute_prefix_isolation_seed("tenant-a", "salt-a"), compute_prefix_isolation_seed("tenant-a", "salt-a"));
+}
+
+TEST(TestComputePrefixIsolationSeed, DifferentTenantsProduceDifferentSeeds) {
+    EXPECT_NE(compute_prefix_isolation_seed("tenant-a", ""), compute_prefix_isolation_seed("tenant-b", ""));
+}
+
+TEST(TestComputePrefixIsolationSeed, DifferentSaltsProduceDifferentSeedsForSameTenant) {
+    EXPECT_NE(compute_prefix_isolation_seed("tenant-a", "salt-1"), compute_prefix_isolation_seed("tenant-a", "salt-2"));
+}
+
+TEST(TestComputePrefixIsolationSeed, ConcatenationAmbiguityIsNotCollapsed) {
+    // Without an unambiguous separator, ("a", "bc") and ("ab", "c") would hash identically.
+    EXPECT_NE(compute_prefix_isolation_seed("a", "bc"), compute_prefix_isolation_seed("ab", "c"));
 }

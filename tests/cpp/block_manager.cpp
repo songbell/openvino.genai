@@ -9,6 +9,7 @@
 #include <set>
 #include <vector>
 
+#include "continuous_batching/cache/kv_cache_isolation_seed.hpp"
 #include "continuous_batching/scheduler.hpp"
 #include "openvino/genai/generation_config.hpp"
 #include "openvino/runtime/core.hpp"
@@ -711,3 +712,76 @@ TEST(TestBlockManager, WarmPrefixCacheTruncatesAtFirstSourceFailureEvenIfLaterBl
     // gets freed back to the pool regardless of what bytes ended up in it.
     EXPECT_EQ(source.filled_blocks.size(), 1u);
 }
+
+TEST(TestBlockManager, DefaultHashRootSeedMatchesUnseededSequenceHash) {
+    constexpr size_t block_size = 4;
+    ov::genai::BlockManager block_manager(/*num_blocks=*/2, /*enable_prefix_caching=*/true, block_size);
+
+    std::vector<int64_t> tokens = {0, 1, 2, 3};
+    auto group = create_sequence_group(tokens, 1);
+    group->schedule_tokens(tokens.size());
+    block_manager.append_slots(group);
+    group->finish_iteration();
+
+    const auto sequence = group->get_running_sequences().at(0);
+    const auto block_hash = block_manager.get_block_table(sequence->get_id(), 0).at(0)->get_hash();
+    // No tenant_id/cache_salt was configured, so the default (0) root seed must leave the hash exactly as
+    // Sequence::get_hash() computes it - the pre-isolation behavior, preserved for single-tenant callers.
+    EXPECT_EQ(block_hash, sequence->get_hash(tokens.size(), block_size));
+}
+
+TEST(TestBlockManager, DifferentTenantRootSeedsProduceDifferentHashesForIdenticalContent) {
+    constexpr size_t block_size = 4;
+    const uint64_t seed_a = ov::genai::compute_prefix_isolation_seed("tenant-a", "");
+    const uint64_t seed_b = ov::genai::compute_prefix_isolation_seed("tenant-b", "");
+    ASSERT_NE(seed_a, 0u);
+    ASSERT_NE(seed_b, 0u);
+    ASSERT_NE(seed_a, seed_b);
+
+    ov::genai::BlockManager bm_a(/*num_blocks=*/2, /*enable_prefix_caching=*/true, block_size, /*num_layers=*/1,
+                                /*fixed_blocks_per_sequence=*/0, /*restore_latest_prefix_block_only=*/false, seed_a);
+    ov::genai::BlockManager bm_b(/*num_blocks=*/2, /*enable_prefix_caching=*/true, block_size, /*num_layers=*/1,
+                                /*fixed_blocks_per_sequence=*/0, /*restore_latest_prefix_block_only=*/false, seed_b);
+
+    std::vector<int64_t> tokens = {5, 6, 7, 8};
+    auto group_a = create_sequence_group(tokens, 1);
+    auto group_b = create_sequence_group(tokens, 2);
+    group_a->schedule_tokens(tokens.size());
+    group_b->schedule_tokens(tokens.size());
+    bm_a.append_slots(group_a);
+    bm_b.append_slots(group_b);
+    group_a->finish_iteration();
+    group_b->finish_iteration();
+
+    const auto hash_a = bm_a.get_block_table(group_a->get_running_sequences().at(0)->get_id(), 0).at(0)->get_hash();
+    const auto hash_b = bm_b.get_block_table(group_b->get_running_sequences().at(0)->get_id(), 0).at(0)->get_hash();
+    EXPECT_NE(hash_a, hash_b);
+}
+
+TEST(TestBlockManager, SameTenantRootSeedProducesSameHashForIdenticalContent) {
+    constexpr size_t block_size = 4;
+    const uint64_t seed = ov::genai::compute_prefix_isolation_seed("tenant-a", "session-1");
+    ASSERT_NE(seed, 0u);
+
+    ov::genai::BlockManager bm_first(/*num_blocks=*/2, /*enable_prefix_caching=*/true, block_size, /*num_layers=*/1,
+                                     /*fixed_blocks_per_sequence=*/0, /*restore_latest_prefix_block_only=*/false, seed);
+    ov::genai::BlockManager bm_second(/*num_blocks=*/2, /*enable_prefix_caching=*/true, block_size, /*num_layers=*/1,
+                                      /*fixed_blocks_per_sequence=*/0, /*restore_latest_prefix_block_only=*/false, seed);
+
+    std::vector<int64_t> tokens = {5, 6, 7, 8};
+    auto group_first = create_sequence_group(tokens, 1);
+    auto group_second = create_sequence_group(tokens, 2);
+    group_first->schedule_tokens(tokens.size());
+    group_second->schedule_tokens(tokens.size());
+    bm_first.append_slots(group_first);
+    bm_second.append_slots(group_second);
+    group_first->finish_iteration();
+    group_second->finish_iteration();
+
+    const auto hash_first =
+        bm_first.get_block_table(group_first->get_running_sequences().at(0)->get_id(), 0).at(0)->get_hash();
+    const auto hash_second =
+        bm_second.get_block_table(group_second->get_running_sequences().at(0)->get_id(), 0).at(0)->get_hash();
+    EXPECT_EQ(hash_first, hash_second);
+}
+

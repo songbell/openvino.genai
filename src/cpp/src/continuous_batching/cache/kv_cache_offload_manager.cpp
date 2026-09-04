@@ -38,8 +38,8 @@ constexpr size_t MAX_FILE_NAME_ATTEMPTS = 16;
 // only ever expected to be reopened on the machine (and build) that wrote it, so this keeps
 // (de)serialization to plain memcpy instead of an explicit wire format.
 constexpr uint32_t MANIFEST_MAGIC = 0x564B564Fu;  // "OVKV"
-constexpr uint32_t MANIFEST_FORMAT_VERSION = 1;
-constexpr size_t MANIFEST_HEADER_SIZE = 48;
+constexpr uint32_t MANIFEST_FORMAT_VERSION = 2;
+constexpr size_t MANIFEST_HEADER_SIZE = 56;
 constexpr size_t MANIFEST_RECORD_SIZE = 24;
 
 constexpr const char* PERSISTENT_DATA_FILE_NAME = "ov_genai_kv_offload.data";
@@ -176,8 +176,9 @@ void KVCacheOffloadManager::remove_persisted_cache(const std::filesystem::path& 
 
 KVCacheOffloadManager::KVCacheOffloadManager(const KVCacheDiskLayout& layout,
                                              const CacheOffloadConfig& config,
-                                             const std::string& device)
-    : m_layout(layout), m_persistent(config.enable_persistence) {
+                                             const std::string& device,
+                                             uint64_t tenant_isolation_seed)
+    : m_layout(layout), m_persistent(config.enable_persistence), m_tenant_isolation_seed(tenant_isolation_seed) {
     OPENVINO_ASSERT(is_supported_device(device),
                     "KV cache disk offload is implemented for CPU and GPU, but the inference device is '",
                     device,
@@ -292,7 +293,7 @@ bool KVCacheOffloadManager::try_recover_persisted_cache(const CacheOffloadConfig
     read_at(manifest_fd, 0, header.data(), header.size());
 
     uint32_t magic = 0, format_version = 0;
-    uint64_t header_slot_size = 0, header_num_slots = 0, model_fp = 0, tokenizer_fp = 0, layout_fp = 0;
+    uint64_t header_slot_size = 0, header_num_slots = 0, model_fp = 0, tokenizer_fp = 0, layout_fp = 0, tenant_fp = 0;
     std::memcpy(&magic, header.data() + 0, sizeof(magic));
     std::memcpy(&format_version, header.data() + 4, sizeof(format_version));
     std::memcpy(&header_slot_size, header.data() + 8, sizeof(header_slot_size));
@@ -300,12 +301,14 @@ bool KVCacheOffloadManager::try_recover_persisted_cache(const CacheOffloadConfig
     std::memcpy(&model_fp, header.data() + 24, sizeof(model_fp));
     std::memcpy(&tokenizer_fp, header.data() + 32, sizeof(tokenizer_fp));
     std::memcpy(&layout_fp, header.data() + 40, sizeof(layout_fp));
+    std::memcpy(&tenant_fp, header.data() + 48, sizeof(tenant_fp));
 
     const bool compatible = magic == MANIFEST_MAGIC && format_version == MANIFEST_FORMAT_VERSION &&
                             header_slot_size == m_slot_size && header_num_slots == m_num_slots &&
                             model_fp == fnv1a_64(config.model_fingerprint) &&
                             tokenizer_fp == fnv1a_64(config.tokenizer_fingerprint) &&
-                            layout_fp == compute_layout_fingerprint(m_layout);
+                            layout_fp == compute_layout_fingerprint(m_layout) &&
+                            tenant_fp == m_tenant_isolation_seed;
     if (!compatible) {
         close_file(manifest_fd);
         GENAI_WARN("KV cache offload persisted cache in '%s' is incompatible with the current model/tokenizer/layout, "
@@ -387,6 +390,7 @@ void KVCacheOffloadManager::create_fresh_persisted_files(const CacheOffloadConfi
     const uint64_t model_fp = fnv1a_64(config.model_fingerprint);
     const uint64_t tokenizer_fp = fnv1a_64(config.tokenizer_fingerprint);
     const uint64_t layout_fp = compute_layout_fingerprint(m_layout);
+    const uint64_t tenant_fp = m_tenant_isolation_seed;
     std::memcpy(header.data() + 0, &magic, sizeof(magic));
     std::memcpy(header.data() + 4, &format_version, sizeof(format_version));
     std::memcpy(header.data() + 8, &header_slot_size, sizeof(header_slot_size));
@@ -394,6 +398,7 @@ void KVCacheOffloadManager::create_fresh_persisted_files(const CacheOffloadConfi
     std::memcpy(header.data() + 24, &model_fp, sizeof(model_fp));
     std::memcpy(header.data() + 32, &tokenizer_fp, sizeof(tokenizer_fp));
     std::memcpy(header.data() + 40, &layout_fp, sizeof(layout_fp));
+    std::memcpy(header.data() + 48, &tenant_fp, sizeof(tenant_fp));
     write_at(m_manifest_fd, 0, header.data(), header.size());
 
     const std::vector<uint8_t> empty_record(MANIFEST_RECORD_SIZE, 0);  // hash=0, checksum=0, valid=0
