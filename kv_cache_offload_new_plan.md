@@ -442,6 +442,77 @@ store 路径的调度节奏已解耦：`on_blocks_overwritten()` 读到设备字
 
 验收标准：batch 路径与单 block 路径输出一致；失败时能逐 block fallback；没有 load 完成前使用未初始化 device block 的窗口。
 
+施工状态：已实现任务 1/2/3（batch API + 单 block fallback + 真实设备侧合批），并在真实 GPU 上验证；
+任务 4/5 明确推迟，原因如下。
+
+已完成：`IExternalPrefixSource` 新增 `load_into_many(requests)`，默认实现就是逐个调用 `load_into()`（因此
+任何只实现单 block 接口的旧代码不需要改动即可继续工作，天然满足"不改变单 block fallback"）。
+`KVCacheOffloadCache` 覆盖了这个方法，把整条 chain 的加锁次数从 N 次降为 1 次（`load_into_unlocked()`
+抽出公共逻辑，`load_into()`/`load_into_many()` 都复用它）。`BlockManager::warm_prefix_cache()` 已重构为
+两阶段：第一阶段按原有顺序决定每个位置是内存命中还是需要从 source 加载并预先分配好物理 block（分配时机
+完全不变，仍然逐个检查 `can_allocate_blocks`）；第二阶段对所有"需要加载"的位置一次性调用
+`load_into_many()`，再从第一个失败位置开始整体丢弃（不管失败位置之后是否原本能成功），与逐块调用时"遇错
+即 break"的语义完全一致。已用测试验证：批量结果顺序与单请求一一对应；中间某个 hash 缺失不影响其他请求；
+默认 fallback 对未覆盖批量接口的实现仍然正确；chain 在第一个失败点被整体截断，即使失败点之后的 block
+本来会成功也不会被保留（并记录了这种情况下会有轻微的"多余加载后丢弃"开销，这是正确性优先于极限效率的
+有意选择）。
+
+任务 2/3（保留显式 block-id 映射、不为稀疏 block 硬造连续 buffer）和设备侧真正合批现已一并实现：
+
+`KVCacheManager` 新增 `write_blocks(block_ids, flat_blocks_data)`。它按输入顺序找出连续的物理 block ID
+区间（例如 `[5,6,7,8)`），对每个区间、每一层，把该层 key/value 段的字节从"block-major"（每个 block 内部
+按层顺序排列）重新打包成一个仅覆盖这一层、跨整个区间连续的小 scratch buffer，再用一次 RemoteTensor
+拷贝（`copy_block_range_to_tensor`）写完整个区间，而不是每个 block 各拷贝一次。非连续的 ID（区间长度为 1）
+完全退化为原有的 `copy_block_to_tensor` 单 block 路径，字节结果保证与逐块调用完全一致——不会为了凑批量
+把稀疏 block 硬塞进不必要的连续 buffer；重新打包只发生在本来就连续的区间内部，用于弥合"block-major 源
+数据"和"segment-major 设备拷贝"之间的布局差异，这是达成合批本身必须付出的、且远小于省下的设备调用开销
+的主机侧内存搬运成本。`KVCacheOffloadCache::load_into_many()` 已接入：批量内先逐个 resolve 出每个请求的
+源字节（不落设备），再对全部命中的请求一次性调用 `write_blocks()`，真正把"多次设备调用"降为"按连续区间
+数量的设备调用"。
+
+已用测试验证，包括在本机真实 Intel Arc 140T iGPU 上跑通的 RemoteTensor 合批用例：
+- CPU：连续区间、稀疏 ID、单区间+多区间混合、单个请求，字节结果与逐块 `write_block()` 完全一致。
+- 真实 GPU（`TestCacheManager.test_gpu_batch_write_contiguous_run_matches_per_block` /
+  `test_gpu_batch_write_mixed_runs_and_gaps_matches_per_block`）：同样的场景在真实 RemoteTensor 上验证
+  通过。
+- 接入 `load_into_many` 后，完整的 `TestKVCacheOffloadEndToEnd` 套件在真实 GPU + 真实模型
+  （`C:\Users\gta\e2e_gpu_llama`）上重新跑通：输出文本一致、设备内存不增长、offload 命中路径耗时可测。
+
+修正：本机确实装有 Intel(R) Arc(TM) 140T GPU（核显），`ov::Core().get_available_devices()` 能正常识别
+（`full_name: Intel(R) Arc(TM) 140T GPU (8GB) (iGPU)`），且已用 `C:\Users\gta\e2e_gpu_llama` 这个现成
+导出模型在真实 GPU 上跑通 `TestKVCacheOffloadEndToEnd` 全部非 VLM 用例（4 passed，1 skipped 因为没有
+VLM 模型，不是失败）。此前声称"本环境没有可用的 GPU 硬件"是没有先核实就下的错误结论，已更正。因此
+"没有硬件可验证"不再是任务 4/5 或设备侧合批的推迟理由；上面 segment-major 布局冲突仍然是设备侧合批
+本身的真实技术顾虑，与硬件可用性无关，继续保留。
+
+任务 5（GPU plugin queue 同步、RemoteTensor host visibility）已核实为现有保证，不需要新增代码。证据链
+（均为 `openvino` 仓库源码，非本仓库）：
+1. `KVCacheManager` 用到的 `ov::RemoteTensor::copy_to()/copy_from()` 分发到
+   `RemoteTensorImpl::copy_to`/`copy_from`（`src/plugins/intel_gpu/src/plugin/remote_tensor.cpp`）。
+2. 二者内部统一走 `MemWrapper::copy_to()`，其中 `const bool is_blocking = true;` 是无条件硬编码，覆盖
+   device↔host、device↔device、sub-byte 等全部路径，没有任何分支会关闭它。
+3. 最终落到 `gpu_buffer::copy_from`/`copy_to`（`src/plugins/intel_gpu/src/runtime/ocl/ocl_memory.cpp`），
+   把这个 `blocking` 参数直接传给 OpenCL 标准 API `enqueueWriteBuffer`/`enqueueReadBuffer` 的
+   `cl_bool blocking` 参数；按 OpenCL 规范，`blocking=CL_TRUE` 时调用在数据传输真正完成前不会返回。
+
+也就是说，`KVCacheManager` 目前用到的每一次单 block 拷贝、以及本次新增的合批区间拷贝，在返回前都已经
+被 OpenVINO GPU 插件保证：GPU 命令队列执行完毕且数据对 host/device 双方可见。这不是本仓库需要维护的
+不变量，而是 OpenVINO 公共 API `RemoteTensor::copy_to/copy_from` 的既有契约，已经被本次新增的真实 GPU
+测试（`test_gpu_batch_write_*`、`TestKVCacheOffloadEndToEnd`）间接验证：如果这个阻塞保证不成立，这些
+测试会表现为读到未初始化或旧数据的间歇性失败，而不是稳定通过。
+
+任务 4（load task/completion/commit 状态机，load 完成前不暴露给 ModelRunner）在当前设计下不适用，
+而不是被推迟：这个任务描述的问题只有在存在"异步 load 队列"时才会出现（load 已发起但尚未完成、
+调用方却已经能看到目标 block）。当前 `warm_prefix_cache()`/`load_into_many()`/`write_blocks()` 全部
+是同步调用——函数返回之前，所有涉及的字节已经確定写完（见上面任务 5 的证据），`restore_cached_blocks()`
+把 block table 暴露给序列只会发生在 `warm_prefix_cache()` 完全返回之后。也就是说，现在没有"未完成的
+load"这个状态可以泄漏给 ModelRunner，因为没有任何东西在异步进行。真正需要任务 4 的前提是先决定要不要
+把 disk/host 恢复做成后台异步执行（不阻塞调度器热路径）——这是一个全新的功能需求，不是修补现有代码的
+缺口，需要先确认是否有具体的性能证据支撑（例如 Phase 1 的 cost breakdown 显示同步恢复确实阻塞了调度
+循环），再决定是否值得引入。
+
+至此 Phase 3 中可以在不引入新的异步架构、且能被真实证据支撑的部分已经全部完成或验证清楚。
+
 ### Phase 4：跨重启持久化
 
 目标：在语义稳定后，支持可验证的跨 pipeline/重启 cache reuse。

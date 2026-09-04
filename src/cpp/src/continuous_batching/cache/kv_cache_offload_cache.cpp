@@ -278,7 +278,82 @@ bool KVCacheOffloadCache::contains(std::size_t hash) const {
 
 bool KVCacheOffloadCache::load_into(std::size_t hash, std::size_t block_index) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    return load_into_unlocked(hash, block_index);
+}
 
+std::vector<bool> KVCacheOffloadCache::load_into_many(const std::vector<std::pair<std::size_t, std::size_t>>& requests) {
+    // One lock for the whole chain instead of one per request: restoring a long prefix otherwise pays a
+    // separate lock/unlock cycle (and contends with the background writer) for every single block.
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<bool> results(requests.size(), false);
+
+    // Resolve every request's source bytes first, without touching the device yet, so the actual writes
+    // can be handed to KVCacheManager::write_blocks() as one call instead of one per request: contiguous
+    // destination runs then collapse into a single device transfer per layer instead of one per block.
+    std::vector<size_t> block_ids;
+    std::vector<uint8_t> flat_data;
+    std::vector<size_t> result_indices;
+    block_ids.reserve(requests.size());
+    result_indices.reserve(requests.size());
+    std::vector<uint8_t> resolved;
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& [hash, block_index] = requests[i];
+        if (!resolve_unlocked(hash, resolved)) {
+            continue;
+        }
+        block_ids.push_back(block_index);
+        result_indices.push_back(i);
+        flat_data.insert(flat_data.end(), resolved.begin(), resolved.end());
+    }
+
+    if (!block_ids.empty()) {
+        try {
+            m_cache_manager.write_blocks(block_ids, flat_data);
+            for (size_t idx : result_indices) {
+                results[idx] = true;
+                ++m_statistics.num_loaded;
+            }
+            if (m_enable_detailed_logging) {
+                GENAI_INFO("[KV_TRACE] offload_load_blocks count=%zu", block_ids.size());
+            }
+        } catch (const std::exception& error) {
+            GENAI_WARN("KV cache offload batch load failed for %zu block(s): %s", block_ids.size(), error.what());
+            m_statistics.num_failed += block_ids.size();
+        }
+    }
+    return results;
+}
+
+/// Resolves @p hash's source bytes into @p destination, tracking the same per-tier statistics
+/// load_into_unlocked() would for a single request, without touching the device. Caller must hold m_mutex.
+bool KVCacheOffloadCache::resolve_unlocked(std::size_t hash, std::vector<uint8_t>& destination) {
+    try {
+        if (const QueuedStore* queued = find_queued(hash)) {
+            ++m_statistics.num_load_staging;
+            destination = queued->data;
+        } else if (const std::vector<uint8_t>* host_data = m_host_pool.get(hash)) {
+            ++m_statistics.num_load_host;
+            destination = *host_data;
+        } else {
+            auto it = m_entries.find(hash);
+            if (it == m_entries.end()) {
+                ++m_statistics.num_load_misses;
+                return false;
+            }
+            ++m_statistics.num_load_disk;
+            ScopedTimer timer(m_statistics.load_disk_us);
+            m_backend->read_slot(it->second.slot_id, destination);
+        }
+    } catch (const std::exception& error) {
+        GENAI_WARN("KV cache offload resolve failed for hash %zu: %s", hash, error.what());
+        ++m_statistics.num_failed;
+        return false;
+    }
+    return true;
+}
+
+bool KVCacheOffloadCache::load_into_unlocked(std::size_t hash, std::size_t block_index) {
     // Branch order mirrors BlockLocation's priority: in_flight > host_resident > disk_resident.
     try {
         if (const QueuedStore* queued = find_queued(hash)) {

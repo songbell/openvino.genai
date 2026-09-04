@@ -314,6 +314,51 @@ TEST(TestKVCacheOffloadCache, KeepsDistinctHashesInSeparateSlots) {
     EXPECT_EQ(restored, second);
 }
 
+TEST(TestKVCacheOffloadCache, LoadIntoManyMatchesPerRequestOrderAndResults) {
+    CacheFixture fixture(/*num_blocks=*/NUM_PHYSICAL_BLOCKS);
+    auto offload_cache = make_offload_cache(fixture, 2);
+    const auto first = fixture.fill_block(0, /*seed=*/11);
+    const auto second = fixture.fill_block(1, /*seed=*/77);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/1, make_block_set(0));
+    offload_cache->on_blocks_overwritten(/*hash=*/2, make_block_set(1));
+    offload_cache->flush();
+
+    fixture.fill_block(2, /*seed=*/0);
+    fixture.fill_block(3, /*seed=*/0);
+    const auto results = offload_cache->load_into_many({{1, 2}, {2, 3}});
+
+    ASSERT_EQ(results.size(), 2u);
+    EXPECT_TRUE(results[0]);
+    EXPECT_TRUE(results[1]);
+    EXPECT_EQ(fixture.cache_manager->read_block(2), first);
+    EXPECT_EQ(fixture.cache_manager->read_block(3), second);
+    EXPECT_EQ(offload_cache->get_statistics().num_loaded, 2);
+}
+
+TEST(TestKVCacheOffloadCache, LoadIntoManyReportsPerRequestMissWithoutAffectingOthers) {
+    CacheFixture fixture(/*num_blocks=*/NUM_PHYSICAL_BLOCKS);
+    auto offload_cache = make_offload_cache(fixture, 2);
+    const auto known = fixture.fill_block(0, /*seed=*/9);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/1, make_block_set(0));
+    offload_cache->flush();
+
+    const auto untouched = fixture.fill_block(2, /*seed=*/0);
+    fixture.fill_block(3, /*seed=*/0);
+    // Middle request (hash 999) is unknown; it must not stop the other two from being served.
+    const auto results = offload_cache->load_into_many({{1, 3}, {999, 2}, {1, 3}});
+
+    ASSERT_EQ(results.size(), 3u);
+    EXPECT_TRUE(results[0]);
+    EXPECT_FALSE(results[1]);
+    EXPECT_TRUE(results[2]);
+    EXPECT_EQ(fixture.cache_manager->read_block(3), known);
+    // block_index=2 was never touched since its request (hash 999) missed.
+    EXPECT_EQ(fixture.cache_manager->read_block(2), untouched);
+    EXPECT_EQ(offload_cache->get_statistics().num_load_misses, 1);
+}
+
 TEST(TestKVCacheOffloadCache, ReplacesOldestEntryWhenFileIsFull) {
     CacheFixture fixture;
     auto offload_cache = make_offload_cache(fixture, 1);

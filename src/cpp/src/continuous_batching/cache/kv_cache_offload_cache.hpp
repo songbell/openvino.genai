@@ -12,6 +12,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "continuous_batching/cache/block_manager.hpp"
@@ -106,6 +107,9 @@ public:
 
     bool load_into(std::size_t hash, std::size_t block_index) override;
 
+    /// Overridden to hold the lock once for the whole chain instead of once per request.
+    std::vector<bool> load_into_many(const std::vector<std::pair<std::size_t, std::size_t>>& requests) override;
+
     /// @return Which tier(s), if any, currently hold @p hash's contents.
     BlockLocation get_location(std::size_t hash) const;
 
@@ -150,6 +154,13 @@ private:
 
     /// @return The unified location for @p hash. Caller must already hold `m_mutex`.
     BlockLocation locate_unlocked(std::size_t hash) const;
+
+    /// @return Whether @p block_index was filled for @p hash. Caller must already hold `m_mutex`.
+    bool load_into_unlocked(std::size_t hash, std::size_t block_index);
+
+    /// @return Whether source bytes for @p hash were resolved into @p destination, without writing to the
+    /// device. Caller must already hold `m_mutex`.
+    bool resolve_unlocked(std::size_t hash, std::vector<uint8_t>& destination);
 
     void publish(std::size_t hash, std::size_t slot_id, bool reclaimed);
 

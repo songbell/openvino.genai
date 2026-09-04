@@ -5,6 +5,9 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <map>
+#include <set>
+#include <vector>
 
 #include "continuous_batching/scheduler.hpp"
 #include "openvino/genai/generation_config.hpp"
@@ -638,4 +641,73 @@ TEST(TestBlockManager, PrefixRestoreStalePlanReturnsFalseWithoutRestoring) {
 
     EXPECT_FALSE(block_manager.restore_cached_blocks(consumer_group, stale_plan));
     EXPECT_FALSE(block_manager.has_block_table(consumer_group->get_running_sequences().at(0)->get_id()));
+}
+
+namespace {
+
+/// Minimal IExternalPrefixSource that only implements the required single-block methods, to verify the
+/// interface's default load_into_many() falls back correctly for implementers that don't override it.
+/// `known_hashes` and `contents` are tracked separately so a test can make contains() report a hash as
+/// available while load_into() still fails for it, simulating a read error on an otherwise-known block.
+class FakePrefixSource : public ov::genai::IExternalPrefixSource {
+public:
+    std::set<size_t> known_hashes;
+    std::map<size_t, std::vector<uint8_t>> contents;
+    std::map<size_t, std::vector<uint8_t>> filled_blocks;
+
+    bool contains(size_t hash) const override {
+        return known_hashes.count(hash) > 0;
+    }
+
+    bool load_into(size_t hash, size_t block_index) override {
+        auto it = contents.find(hash);
+        if (it == contents.end()) {
+            return false;
+        }
+        filled_blocks[block_index] = it->second;
+        return true;
+    }
+};
+
+}  // namespace
+
+TEST(TestBlockManager, LoadIntoManyDefaultFallsBackToPerRequestLoadInto) {
+    FakePrefixSource source;
+    source.known_hashes = {1, 2};
+    source.contents[1] = {10, 11};
+    source.contents[2] = {20, 21};
+
+    const auto results = source.load_into_many({{1, 100}, {999, 200}, {2, 300}});
+
+    ASSERT_EQ(results.size(), 3u);
+    EXPECT_TRUE(results[0]);
+    EXPECT_FALSE(results[1]);
+    EXPECT_TRUE(results[2]);
+    EXPECT_EQ(source.filled_blocks.at(100), source.contents.at(1));
+    EXPECT_EQ(source.filled_blocks.at(300), source.contents.at(2));
+    EXPECT_EQ(source.filled_blocks.count(200), 0u);
+}
+
+TEST(TestBlockManager, WarmPrefixCacheTruncatesAtFirstSourceFailureEvenIfLaterBlocksWouldSucceed) {
+    constexpr size_t block_size = 4;
+    ov::genai::BlockManager block_manager(/*num_blocks=*/4, /*enable_prefix_caching=*/true, block_size);
+
+    std::vector<int64_t> tokens = {0, 1, 2, 3, 4, 5, 6, 7};
+    auto consumer_group = create_sequence_group(tokens, 40);
+    const auto sequence = consumer_group->get_running_sequences().at(0);
+    const auto first_hash = sequence->get_hash(block_size, block_size);
+    const auto second_hash = sequence->get_hash(2 * block_size, block_size);
+
+    FakePrefixSource source;
+    // Both blocks are reported as available, but only the second one actually has data to load, simulating
+    // a read failure on the first: the whole chain must be discarded, not just the failed block.
+    source.known_hashes = {first_hash, second_hash};
+    source.contents[second_hash] = {1, 2, 3, 4};
+
+    EXPECT_EQ(block_manager.warm_prefix_cache(consumer_group, source), 0u);
+    EXPECT_FALSE(block_manager.has_block_table(sequence->get_id()));
+    // The plain per-block fallback still loads the second block before the caller learns the first one
+    // failed and discards the whole chain; that's wasted work, not a correctness issue, since the block
+    // gets freed back to the pool regardless of what bytes ended up in it.
+    EXPECT_EQ(source.filled_blocks.size(), 1u);
 }
