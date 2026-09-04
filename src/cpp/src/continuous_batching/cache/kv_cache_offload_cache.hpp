@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "continuous_batching/cache/block_manager.hpp"
+#include "continuous_batching/cache/kv_cache_host_block_pool.hpp"
 #include "continuous_batching/cache/kv_cache_manager.hpp"
 #include "continuous_batching/cache/kv_cache_offload_manager.hpp"
 
@@ -45,7 +46,9 @@ public:
         std::size_t num_queue_peak = 0;
         std::size_t num_load_staging = 0;
         std::size_t num_load_disk = 0;
+        std::size_t num_load_host = 0;
         std::size_t num_load_misses = 0;
+        std::size_t num_host_evictions = 0;
         // TEMPORARY diagnostics, to be removed once the GPU cost breakdown is settled.
         std::size_t store_read_us = 0;
         std::size_t store_write_us = 0;
@@ -71,11 +74,30 @@ public:
         KVCacheOffloadCache& m_cache;
     };
 
+    /**
+     * @brief Where a hash's contents currently live. `DEVICE` residency is intentionally not modeled here:
+     * it is owned by `BlockManager`/`OverwritableBlocksHashStore`, which this class only ever observes
+     * through `on_blocks_overwritten()`, and mirroring it here would create a second, driftable source of
+     * truth. `HOST` and `DISK` are independent tiers with their own eviction, so both bits can be set at
+     * once; `in_flight` and `host_resident` can likewise both be true, since the L1 host copy is seeded as
+     * soon as the bytes leave the device, before the disk write below has necessarily completed.
+     */
+    struct BlockLocation {
+        bool in_flight = false;      // read from device, durable disk write not yet complete
+        bool host_resident = false;  // byte copy present in the L1 host pool
+        bool disk_resident = false;  // durable copy present in the L2 backing file
+
+        bool is_known() const {
+            return in_flight || host_resident || disk_resident;
+        }
+    };
+
     KVCacheOffloadCache(KVCacheManager& cache_manager,
                         std::unique_ptr<KVCacheOffloadManager> backend,
                         std::size_t max_queued_stores = 2,
                         bool wait_for_buffer = false,
-                        bool enable_detailed_logging = false);
+                        bool enable_detailed_logging = false,
+                        std::size_t host_cache_slots = 0);
     ~KVCacheOffloadCache();
 
     void on_blocks_overwritten(std::size_t hash, const BlocksPerLayer& blocks) override;
@@ -83,6 +105,9 @@ public:
     bool contains(std::size_t hash) const override;
 
     bool load_into(std::size_t hash, std::size_t block_index) override;
+
+    /// @return Which tier(s), if any, currently hold @p hash's contents.
+    BlockLocation get_location(std::size_t hash) const;
 
     /// Waits until every queued store has reached the backing file.
     void flush();
@@ -94,6 +119,9 @@ public:
     bool read(std::size_t hash, std::vector<uint8_t>& block_data) const;
 
     std::size_t get_num_entries() const;
+
+    /// @return Number of block snapshots currently resident in the L1 host cache.
+    std::size_t get_num_host_entries() const;
 
     std::size_t get_num_free_slots() const {
         return m_backend->get_num_free_slots();
@@ -120,6 +148,9 @@ private:
 
     const QueuedStore* find_queued(std::size_t hash) const;
 
+    /// @return The unified location for @p hash. Caller must already hold `m_mutex`.
+    BlockLocation locate_unlocked(std::size_t hash) const;
+
     void publish(std::size_t hash, std::size_t slot_id, bool reclaimed);
 
     void run_writer();
@@ -134,6 +165,9 @@ private:
     std::size_t m_max_queued_stores;
     bool m_wait_for_buffer;
     bool m_enable_detailed_logging;
+    // Independent L1 tier: entries here outlive their disk write and are evicted by their own LRU.
+    // Mutable because read-only accessors (e.g. `read()`) still need to refresh LRU recency on a hit.
+    mutable HostBlockPool m_host_pool;
     std::vector<uint8_t> m_staging;
     Statistics m_statistics;
     bool m_reclamation_paused = false;

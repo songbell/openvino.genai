@@ -127,7 +127,8 @@ public:
                                                                    std::move(backend),
                                                                    offload_config.buffer_slots,
                                                                    offload_config.wait_for_buffer,
-                                                                   offload_config.enable_detailed_logging);
+                                                                   offload_config.enable_detailed_logging,
+                                                                   offload_config.host_cache_slots);
         m_block_managers.at(CacheType::KV_CACHE)->set_overwritten_block_observer(m_kv_offload_cache.get());
     }
 

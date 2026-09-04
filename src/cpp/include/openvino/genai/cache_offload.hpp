@@ -36,10 +36,18 @@ struct CacheOffloadConfig {
     /** Whether the offload file may go through the OS page cache. Direct I/O is not implemented yet. */
     bool use_page_cache = true;
 
+    /**
+     * Number of block snapshots kept in an independent host-memory (L1) cache after their disk write
+     * completes, so repeated hits can skip the disk read. 0 disables this tier; entries are dropped from
+     * host memory as soon as they reach disk, matching the pre-Phase-2 behavior.
+     */
+    std::size_t host_cache_slots = 0;
+
     bool operator==(const CacheOffloadConfig& other) const {
         return path == other.path && capacity_bytes == other.capacity_bytes &&
              buffer_slots == other.buffer_slots && wait_for_buffer == other.wait_for_buffer &&
-             enable_detailed_logging == other.enable_detailed_logging && use_page_cache == other.use_page_cache;
+             enable_detailed_logging == other.enable_detailed_logging && use_page_cache == other.use_page_cache &&
+             host_cache_slots == other.host_cache_slots;
     }
 
     std::string to_string() const {
@@ -51,6 +59,7 @@ struct CacheOffloadConfig {
         oss << "    wait_for_buffer: " << std::boolalpha << wait_for_buffer << "\n";
         oss << "    enable_detailed_logging: " << std::boolalpha << enable_detailed_logging << "\n";
         oss << "    use_page_cache: " << std::boolalpha << use_page_cache << "\n";
+        oss << "    host_cache_slots: " << host_cache_slots << "\n";
         oss << "  }";
         return oss.str();
     }

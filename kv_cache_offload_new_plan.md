@@ -396,6 +396,36 @@ L0 device block
 
 注意：这一阶段不能简单把现有 staging buffer 改名为 HostBlockPool；必须解决 host entry 的长期 ownership、LRU 和 slot 一致性。
 
+施工状态：已实现独立的 `HostBlockPool`（[kv_cache_host_block_pool.hpp](src/cpp/src/continuous_batching/cache/kv_cache_host_block_pool.hpp)），
+容量由新增的 `CacheOffloadConfig::host_cache_slots` 配置（默认 0，即关闭，保持旧行为不变）。磁盘写完成
+（`publish()`）后不再立即丢弃 host 字节副本，而是写入这个独立 LRU 池；`load_into()` 的命中顺序改为
+in-flight staging -> L1 host pool -> L2 disk，磁盘条目被 host 池淘汰或磁盘条目被 LRU 顶替都不会互相影响
+对方，两层各自独立淘汰。已覆盖的测试：L1 命中不触发磁盘读、host 池按自身容量独立淘汰（同一 hash 磁盘仍
+命中，但改为走磁盘路径）。
+
+已补齐 `HOST`/`DISK`/`STORE_IN_FLIGHT` 三态的统一状态查询：新增 `KVCacheOffloadCache::BlockLocation`
+（`in_flight`/`host_resident`/`disk_resident` 三个布尔位，`HOST`/`DISK` 允许同时为真，因为两层本来就
+独立淘汰）和公开方法 `get_location(hash)`，`contains()` 与 store 路径的"已存在"判断都改为调用同一个
+`locate_unlocked()`，不再各自重复三次查找。已覆盖测试：未知 hash 为全 false；store 尚未落盘前 in-flight
+与 disk_resident 不会同时为真；host cache 关闭时只有 DISK；磁盘 slot 被顶替后 host 侧仍能报告 HOST-only；
+host+disk 都命中时两位同时为真。
+
+`DEVICE` 态经过讨论后明确不纳入这个统一状态：它由 `BlockManager`/`OverwritableBlocksHashStore` 独立管理和
+加锁，`KVCacheOffloadCache` 只通过 `on_blocks_overwritten()` 单向接收通知；把 `DEVICE` 状态镜像进这个类
+需要打通两个子系统的边界，代价是引入第二个可能与真实来源不一致的状态副本，收益仅仅是"看起来更完整"，
+不改变任何可观察行为，所以未实现，仍按原样只由 `BlockManager` 一侧持有。
+
+store 路径的调度节奏已解耦：`on_blocks_overwritten()` 读到设备字节后立即调用 `m_host_pool.put()`，L1
+入口不再等磁盘写完成；`publish()` 现在只登记磁盘 slot，不再触碰 host 池。已用测试验证 L1 在磁盘写完成前
+即可命中（`L1IsSeededBeforeDiskWriteCompletes`）。
+
+未采用“L1 压力超阈值才写 L2”的字面语义：磁盘写依然对每一次 store 都无条件发生，而不是只在 L1 淘汰时才
+补写。这是有意的取舍——如果改成后者，`host_cache_slots=0`（默认关闭 L1）时将永远不会有任何数据落盘，
+直接破坏 Phase 0/1 已经验证过的默认离线能力；即使 `host_cache_slots>0`，把持久化改成仅在内存压力下才
+发生，也会让"数据是否已经落盘"变得依赖淘汰时机而不是每次 store 的确定性保证，本 Phase 2 已提交的多个测试
+（如 `GetLocationIsHostAndDiskAfterPublishWithHostCacheEnabled`）都假设 flush 后必然可查到磁盘副本。因此
+选择了侵入更小、不改变持久化保证的版本：仅解耦"L1 何时可见"，不解耦"是否写 L2"。
+
 ### Phase 3：批量 GPU 传输和异步 load
 
 目标：降低大量 sparse physical block 的逐 block 传输开销。

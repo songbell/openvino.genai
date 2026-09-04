@@ -315,12 +315,7 @@ void init_continuous_batching_pipeline(py::module_& m) {
     py::class_<GenerationResult>(m, "GenerationResult", generation_result_docstring)
         .def(py::init<>())
         .def_readonly("m_request_id", &GenerationResult::m_request_id)
-                CacheOffloadConfig config;
-                config.path = path;
-                config.capacity_bytes = capacity_bytes;
-                config.buffer_slots = buffer_slots;
-                config.use_page_cache = use_page_cache;
-                return config; }),
+        .def_property("m_generation_ids",
             [](GenerationResult &r) -> py::typing::List<py::str> {
                 return pyutils::handle_utf8(r.m_generation_ids);
             },
@@ -470,7 +465,12 @@ void init_continuous_batching_pipeline(py::module_& m) {
     py::class_<CacheOffloadConfig>(m, "CacheOffloadConfig", cache_offload_config_docstring)
             .def(py::init<>())
             .def(py::init([](const std::string& path, size_t capacity_bytes, size_t buffer_slots, bool use_page_cache) {
-                return CacheOffloadConfig{path, capacity_bytes, buffer_slots, use_page_cache}; }),
+                CacheOffloadConfig config;
+                config.path = path;
+                config.capacity_bytes = capacity_bytes;
+                config.buffer_slots = buffer_slots;
+                config.use_page_cache = use_page_cache;
+                return config; }),
                  py::arg("path") = std::string{},
                  py::arg("capacity_bytes") = 0,
                  py::arg("buffer_slots") = 2,
@@ -481,6 +481,7 @@ void init_continuous_batching_pipeline(py::module_& m) {
             .def_readwrite("wait_for_buffer", &CacheOffloadConfig::wait_for_buffer)
             .def_readwrite("enable_detailed_logging", &CacheOffloadConfig::enable_detailed_logging)
             .def_readwrite("use_page_cache", &CacheOffloadConfig::use_page_cache)
+            .def_readwrite("host_cache_slots", &CacheOffloadConfig::host_cache_slots)
             .def("to_string", &CacheOffloadConfig::to_string);
 
     py::class_<SchedulerConfig>(m, "SchedulerConfig", scheduler_config_docstring)

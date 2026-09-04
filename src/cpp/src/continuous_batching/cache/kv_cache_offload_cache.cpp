@@ -35,12 +35,14 @@ KVCacheOffloadCache::KVCacheOffloadCache(KVCacheManager& cache_manager,
                                          std::unique_ptr<KVCacheOffloadManager> backend,
                                                                                  std::size_t max_queued_stores,
                                                                                  bool wait_for_buffer,
-                                                                                 bool enable_detailed_logging)
+                                                                                 bool enable_detailed_logging,
+                                                                                 std::size_t host_cache_slots)
     : m_cache_manager(cache_manager),
       m_backend(std::move(backend)),
             m_max_queued_stores(max_queued_stores),
             m_wait_for_buffer(wait_for_buffer),
-            m_enable_detailed_logging(enable_detailed_logging) {
+            m_enable_detailed_logging(enable_detailed_logging),
+            m_host_pool(host_cache_slots) {
     OPENVINO_ASSERT(m_backend != nullptr, "KV cache offload backend must not be null");
     OPENVINO_ASSERT(m_max_queued_stores > 0, "KV cache offload needs at least one staging buffer");
     OPENVINO_ASSERT(m_max_queued_stores <= CACHE_OFFLOAD_MAX_BUFFER_SLOTS,
@@ -61,7 +63,7 @@ KVCacheOffloadCache::~KVCacheOffloadCache() {
     }
     // TEMPORARY diagnostics, to be removed once the GPU cost breakdown is settled.
     GENAI_INFO("[KV_TRACE] offload_stats stored=%zu replaced=%zu loaded=%zu failed=%zu dropped=%zu "
-               "queue_peak=%zu load_staging=%zu load_disk=%zu load_miss=%zu "
+               "queue_peak=%zu load_staging=%zu load_host=%zu load_disk=%zu load_miss=%zu host_evictions=%zu "
                "store_read=%zu us store_write=%zu us load_disk_time=%zu us load_write=%zu us",
                m_statistics.num_stored,
                m_statistics.num_replaced,
@@ -70,8 +72,10 @@ KVCacheOffloadCache::~KVCacheOffloadCache() {
                m_statistics.num_dropped_no_buffer,
                m_statistics.num_queue_peak,
                m_statistics.num_load_staging,
+               m_statistics.num_load_host,
                m_statistics.num_load_disk,
                m_statistics.num_load_misses,
+               m_statistics.num_host_evictions,
                m_statistics.store_read_us,
                m_statistics.store_write_us,
                m_statistics.load_disk_us,
@@ -90,7 +94,7 @@ void KVCacheOffloadCache::on_blocks_overwritten(std::size_t hash, const BlocksPe
 
     std::unique_lock<std::mutex> lock(m_mutex);
 
-    if (m_entries.find(hash) != m_entries.end() || find_queued(hash) != nullptr) {
+    if (locate_unlocked(hash).is_known()) {
         // Contents are content-addressed by `hash`, so the stored copy already holds the same data.
         ++m_statistics.num_already_present;
         return;
@@ -141,6 +145,12 @@ void KVCacheOffloadCache::on_blocks_overwritten(std::size_t hash, const BlocksPe
 
     m_queued_stores.push_back(std::move(queued));
     m_statistics.num_queue_peak = std::max(m_statistics.num_queue_peak, m_queued_stores.size());
+    // L0 -> L1 happens now, independent of whether the disk write below ever completes: a hash becomes
+    // host-visible as soon as it leaves the device, not only after a durable disk round-trip. `queued.data`
+    // was moved above, so this reads the buffered copy back out of the deque entry that now owns it.
+    if (m_host_pool.put(hash, m_queued_stores.back().data).has_value()) {
+        ++m_statistics.num_host_evictions;
+    }
     if (m_enable_detailed_logging) {
         GENAI_INFO("[KV_TRACE] KVCacheOffloadCache queue_store hash=%zu physical_block=%d queued=%zu",
                    hash,
@@ -200,6 +210,8 @@ void KVCacheOffloadCache::publish(std::size_t hash, std::size_t slot_id, bool re
     if (reclaimed) {
         ++m_statistics.num_replaced;
     }
+    // The L1 host copy was already seeded in on_blocks_overwritten; this only records disk durability and
+    // must not re-touch or re-evict the independent host tier.
     if (m_enable_detailed_logging) {
         GENAI_INFO("[KV_TRACE] KVCacheOffloadCache publish hash=%zu slot=%zu entries=%zu replaced=%s",
                    hash,
@@ -221,6 +233,19 @@ const KVCacheOffloadCache::QueuedStore* KVCacheOffloadCache::find_queued(std::si
         }
     }
     return nullptr;
+}
+
+KVCacheOffloadCache::BlockLocation KVCacheOffloadCache::locate_unlocked(std::size_t hash) const {
+    BlockLocation location;
+    location.in_flight = find_queued(hash) != nullptr;
+    location.host_resident = m_host_pool.contains(hash);
+    location.disk_resident = m_entries.find(hash) != m_entries.end();
+    return location;
+}
+
+KVCacheOffloadCache::BlockLocation KVCacheOffloadCache::get_location(std::size_t hash) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return locate_unlocked(hash);
 }
 
 KVCacheOffloadCache::ScopedReclamationPause::ScopedReclamationPause(KVCacheOffloadCache& cache) : m_cache(cache) {
@@ -248,12 +273,13 @@ std::optional<std::size_t> KVCacheOffloadCache::reclaim_oldest_slot() {
 
 bool KVCacheOffloadCache::contains(std::size_t hash) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_entries.find(hash) != m_entries.end() || find_queued(hash) != nullptr;
+    return locate_unlocked(hash).is_known();
 }
 
 bool KVCacheOffloadCache::load_into(std::size_t hash, std::size_t block_index) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
+    // Branch order mirrors BlockLocation's priority: in_flight > host_resident > disk_resident.
     try {
         if (const QueuedStore* queued = find_queued(hash)) {
             // Still on its way to disk, so the staging copy is the closest source.
@@ -265,6 +291,16 @@ bool KVCacheOffloadCache::load_into(std::size_t hash, std::size_t block_index) {
             }
             ScopedTimer timer(m_statistics.load_write_us);
             m_cache_manager.write_block(block_index, queued->data);
+        } else if (const std::vector<uint8_t>* host_data = m_host_pool.get(hash)) {
+            // L1 hit: skip the disk entirely.
+            ++m_statistics.num_load_host;
+            if (m_enable_detailed_logging) {
+                GENAI_INFO("[KV_TRACE] KVCacheOffloadCache load hash=%zu source=host physical_block=%zu",
+                           hash,
+                           block_index);
+            }
+            ScopedTimer timer(m_statistics.load_write_us);
+            m_cache_manager.write_block(block_index, *host_data);
         } else {
             auto it = m_entries.find(hash);
             if (it == m_entries.end()) {
@@ -304,6 +340,10 @@ bool KVCacheOffloadCache::read(std::size_t hash, std::vector<uint8_t>& block_dat
         block_data = queued->data;
         return true;
     }
+    if (const std::vector<uint8_t>* host_data = m_host_pool.get(hash)) {
+        block_data = *host_data;
+        return true;
+    }
     auto it = m_entries.find(hash);
     if (it == m_entries.end()) {
         return false;
@@ -315,6 +355,11 @@ bool KVCacheOffloadCache::read(std::size_t hash, std::vector<uint8_t>& block_dat
 std::size_t KVCacheOffloadCache::get_num_entries() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_entries.size();
+}
+
+std::size_t KVCacheOffloadCache::get_num_host_entries() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_host_pool.size();
 }
 
 KVCacheOffloadCache::Statistics KVCacheOffloadCache::get_statistics() const {

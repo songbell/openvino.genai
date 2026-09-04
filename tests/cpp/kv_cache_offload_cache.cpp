@@ -61,6 +61,20 @@ std::unique_ptr<KVCacheOffloadCache> make_offload_cache(CacheFixture& fixture, s
     return std::make_unique<KVCacheOffloadCache>(*fixture.cache_manager, std::move(backend), /*max_queued_stores=*/8);
 }
 
+std::unique_ptr<KVCacheOffloadCache> make_offload_cache_with_host_pool(CacheFixture& fixture,
+                                                                       size_t num_slots,
+                                                                       size_t host_cache_slots) {
+    auto backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(),
+                                                           make_offload_config(fixture, num_slots),
+                                                           "CPU");
+    return std::make_unique<KVCacheOffloadCache>(*fixture.cache_manager,
+                                                 std::move(backend),
+                                                 /*max_queued_stores=*/8,
+                                                 /*wait_for_buffer=*/false,
+                                                 /*enable_detailed_logging=*/false,
+                                                 host_cache_slots);
+}
+
 BlocksPerLayer make_block_set(int physical_block_id) {
     return BlocksPerLayer{std::make_shared<CacheBlock>(physical_block_id)};
 }
@@ -72,6 +86,166 @@ SequenceGroup::Ptr make_group(const std::vector<int64_t>& tokens, uint64_t reque
 }
 
 }  // namespace
+
+TEST(TestKVCacheOffloadCache, HostCacheDisabledByDefaultKeepsNoHostEntries) {
+    CacheFixture fixture;
+    auto offload_cache = make_offload_cache(fixture, 2);
+    fixture.fill_block(0, /*seed=*/1);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/9, make_block_set(0));
+    offload_cache->flush();
+
+    EXPECT_EQ(offload_cache->get_num_entries(), 1);
+    EXPECT_EQ(offload_cache->get_num_host_entries(), 0);
+}
+
+TEST(TestKVCacheOffloadCache, L1HitAvoidsDiskRead) {
+    CacheFixture fixture;
+    auto offload_cache = make_offload_cache_with_host_pool(fixture, /*num_slots=*/2, /*host_cache_slots=*/2);
+    const auto expected = fixture.fill_block(0, /*seed=*/13);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/21, make_block_set(0));
+    offload_cache->flush();
+    ASSERT_EQ(offload_cache->get_num_host_entries(), 1);
+
+    fixture.fill_block(1, /*seed=*/0);
+    ASSERT_TRUE(offload_cache->load_into(/*hash=*/21, /*block_index=*/1));
+
+    EXPECT_EQ(fixture.cache_manager->read_block(1), expected);
+    EXPECT_EQ(offload_cache->get_statistics().num_load_host, 1);
+    EXPECT_EQ(offload_cache->get_statistics().num_load_disk, 0);
+}
+
+TEST(TestKVCacheOffloadCache, HostPoolEvictsIndependentlyFromDisk) {
+    CacheFixture fixture(/*num_blocks=*/NUM_PHYSICAL_BLOCKS);
+    // Disk has room for both blocks, but the host pool only has room for the most recent one.
+    auto offload_cache = make_offload_cache_with_host_pool(fixture, /*num_slots=*/4, /*host_cache_slots=*/1);
+    const auto first = fixture.fill_block(0, /*seed=*/5);
+    const auto second = fixture.fill_block(1, /*seed=*/90);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/100, make_block_set(0));
+    offload_cache->flush();
+    offload_cache->on_blocks_overwritten(/*hash=*/200, make_block_set(1));
+    offload_cache->flush();
+
+    // Both survive on disk...
+    EXPECT_EQ(offload_cache->get_num_entries(), 2);
+    // ...but only the newer one is still resident in the host pool.
+    EXPECT_EQ(offload_cache->get_num_host_entries(), 1);
+    EXPECT_EQ(offload_cache->get_statistics().num_host_evictions, 1);
+
+    fixture.fill_block(2, /*seed=*/0);
+    fixture.fill_block(3, /*seed=*/0);
+
+    // The evicted-from-host hash still round-trips correctly, just via a disk read this time.
+    ASSERT_TRUE(offload_cache->load_into(/*hash=*/100, /*block_index=*/2));
+    EXPECT_EQ(fixture.cache_manager->read_block(2), first);
+    EXPECT_EQ(offload_cache->get_statistics().num_load_disk, 1);
+
+    ASSERT_TRUE(offload_cache->load_into(/*hash=*/200, /*block_index=*/3));
+    EXPECT_EQ(fixture.cache_manager->read_block(3), second);
+    EXPECT_EQ(offload_cache->get_statistics().num_load_host, 1);
+}
+
+TEST(TestKVCacheOffloadCache, GetLocationReportsUnknownHashAsNone) {
+    CacheFixture fixture;
+    auto offload_cache = make_offload_cache(fixture, 2);
+
+    const auto location = offload_cache->get_location(/*hash=*/12345);
+    EXPECT_FALSE(location.is_known());
+    EXPECT_FALSE(location.in_flight);
+    EXPECT_FALSE(location.host_resident);
+    EXPECT_FALSE(location.disk_resident);
+}
+
+TEST(TestKVCacheOffloadCache, GetLocationNeverOverlapsInFlightWithDisk) {
+    CacheFixture fixture;
+    auto offload_cache = make_offload_cache(fixture, 2);
+    fixture.fill_block(0, /*seed=*/4);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/55, make_block_set(0));
+    // The background writer may already have published by now; either outcome is valid, but a hash must
+    // never be observed as both still queued and already durable on disk at the same time.
+    const auto location = offload_cache->get_location(55);
+    EXPECT_TRUE(location.is_known());
+    EXPECT_FALSE(location.in_flight && location.disk_resident);
+
+    offload_cache->flush();
+    const auto after_flush = offload_cache->get_location(55);
+    EXPECT_FALSE(after_flush.in_flight);
+    EXPECT_TRUE(after_flush.disk_resident);
+}
+
+TEST(TestKVCacheOffloadCache, GetLocationIsHostAndDiskAfterPublishWithHostCacheEnabled) {
+    CacheFixture fixture;
+    auto offload_cache = make_offload_cache_with_host_pool(fixture, /*num_slots=*/2, /*host_cache_slots=*/2);
+    fixture.fill_block(0, /*seed=*/8);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/77, make_block_set(0));
+    offload_cache->flush();
+
+    const auto location = offload_cache->get_location(77);
+    EXPECT_FALSE(location.in_flight);
+    EXPECT_TRUE(location.host_resident);
+    EXPECT_TRUE(location.disk_resident);
+}
+
+TEST(TestKVCacheOffloadCache, L1IsSeededBeforeDiskWriteCompletes) {
+    CacheFixture fixture;
+    auto offload_cache = make_offload_cache_with_host_pool(fixture, /*num_slots=*/2, /*host_cache_slots=*/2);
+    const auto expected = fixture.fill_block(0, /*seed=*/17);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/88, make_block_set(0));
+    // Host residency is set synchronously inside on_blocks_overwritten, so it must be visible immediately,
+    // with no dependency on the background writer having reached disk yet.
+    EXPECT_TRUE(offload_cache->get_location(88).host_resident);
+
+    fixture.fill_block(1, /*seed=*/0);
+    ASSERT_TRUE(offload_cache->load_into(/*hash=*/88, /*block_index=*/1));
+    EXPECT_EQ(fixture.cache_manager->read_block(1), expected);
+    // The background writer may already have published by the time load_into runs, so the hit can
+    // legitimately land on either the in-flight or the host path; only their sum is deterministic.
+    const auto stats = offload_cache->get_statistics();
+    EXPECT_EQ(stats.num_load_staging + stats.num_load_host, 1);
+
+    offload_cache->flush();
+    EXPECT_TRUE(offload_cache->get_location(88).disk_resident);
+}
+
+TEST(TestKVCacheOffloadCache, GetLocationIsDiskOnlyWhenHostCacheDisabled) {
+    CacheFixture fixture;
+    auto offload_cache = make_offload_cache(fixture, 2);  // host_cache_slots defaults to 0
+    fixture.fill_block(0, /*seed=*/2);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/33, make_block_set(0));
+    offload_cache->flush();
+
+    const auto location = offload_cache->get_location(33);
+    EXPECT_FALSE(location.host_resident);
+    EXPECT_TRUE(location.disk_resident);
+}
+
+TEST(TestKVCacheOffloadCache, GetLocationIsHostOnlyAfterDiskReclaimsSlot) {
+    CacheFixture fixture(/*num_blocks=*/NUM_PHYSICAL_BLOCKS);
+    // Disk has room for only one slot, the host pool has room for two: storing a second hash reclaims
+    // the first hash's disk slot, but the host pool keeps both, so the first hash becomes host-only.
+    auto offload_cache = make_offload_cache_with_host_pool(fixture, /*num_slots=*/1, /*host_cache_slots=*/2);
+    fixture.fill_block(0, /*seed=*/6);
+    fixture.fill_block(1, /*seed=*/70);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/300, make_block_set(0));
+    offload_cache->flush();
+    offload_cache->on_blocks_overwritten(/*hash=*/400, make_block_set(1));
+    offload_cache->flush();
+
+    const auto first_location = offload_cache->get_location(300);
+    EXPECT_TRUE(first_location.host_resident);
+    EXPECT_FALSE(first_location.disk_resident);
+
+    const auto second_location = offload_cache->get_location(400);
+    EXPECT_TRUE(second_location.host_resident);
+    EXPECT_TRUE(second_location.disk_resident);
+}
 
 TEST(TestKVCacheOffloadCache, StoresBlockContentsOnOverwrite) {
     CacheFixture fixture;
