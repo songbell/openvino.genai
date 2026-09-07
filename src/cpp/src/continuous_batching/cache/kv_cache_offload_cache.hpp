@@ -35,6 +35,12 @@ namespace ov::genai {
  *
  * Offload is best effort: a failed store is reported through the statistics and never propagates to
  * the caller, since losing a cache entry only costs recomputation.
+ *
+ * This is `new_plan.md`'s `TieredCacheManager` (see its architecture diagram, §2): `m_entries`/
+ * `m_insertion_order` are the L0/L1/L2 migration-state tracking and hit/miss decision engine
+ * (`get_location()`/`resolve_unlocked()`), `m_queued_stores`/the writer thread are the async
+ * swap-out queue, and `m_host_pool` (`HostBlockPool`, the L1 tier) is consulted before falling
+ * through to the L2 disk backend (`m_backend`, an `IKVCacheStorageBackend`).
  */
 class KVCacheOffloadCache : public IOverwrittenBlockObserver, public IExternalPrefixSource {
 public:

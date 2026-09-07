@@ -21,6 +21,14 @@ namespace ov::genai {
  * completes, so repeated hits can be served without touching the backing file. Eviction is LRU
  * and only ever drops the host-resident copy - it never invalidates a hash's disk-backed entry,
  * since the two tiers are tracked independently.
+ *
+ * This is `new_plan.md`'s `HostBlockPool` (§3.2.1); its LRU capacity bookkeeping (`m_entries`/
+ * `m_order`) plays the role that document ascribes to a separate `HostBlockAllocator` - at this
+ * scale (per-entry `std::vector<uint8_t>`, no pinned/pre-allocated backing arena) a dedicated
+ * allocator class would only add indirection, so it has not been split out. Pinned/page-locked
+ * host memory (also mentioned there, for zero-copy DMA) is not implemented: entries are plain
+ * heap buffers, a documented gap left for when a real DMA-bound bottleneck justifies the added
+ * platform-specific complexity.
  */
 class HostBlockPool {
 public:

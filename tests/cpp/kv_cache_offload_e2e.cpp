@@ -67,6 +67,10 @@ SchedulerConfig make_scheduler_config(bool use_offload) {
         // Freeing a sequence releases its whole block table at once, so a staging pool smaller than
         // that burst silently drops most of the blocks and the disk cache fills up only slowly.
         config.cache_offload_config.buffer_slots = 128;
+        // Gives the shared-prefix regeneration tests below a real L1 host-tier hit (not just L2 disk),
+        // on actual hardware: new_plan.md Phase 2's acceptance bar requires proving generated tokens are
+        // unaffected by which tier serves the restore, and this is the only place that exercises it.
+        config.cache_offload_config.host_cache_slots = 16;
     }
     return config;
 }

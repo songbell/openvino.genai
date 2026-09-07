@@ -615,6 +615,54 @@ TEST(TestKVCacheOffloadCache, WarmPrefixCacheRestoresBlocksFromDisk) {
     block_manager.free_sequence(consumer->get_running_sequences().at(0)->get_id());
 }
 
+TEST(TestKVCacheOffloadCache, WarmPrefixCacheRestoresBlocksFromHostPoolUnderMemoryPressure) {
+    constexpr size_t block_size = 4;
+    CacheFixture fixture(/*num_blocks=*/2);
+    // Disk backend is also configured (a persisted entry always exists), but the L1 host pool has
+    // room for every evicted block, so the restore below should be served from L1, not L2.
+    auto offload_cache = make_offload_cache_with_host_pool(fixture, /*num_slots=*/2, /*host_cache_slots=*/2);
+
+    BlockManager block_manager(/*num_blocks=*/2, /*enable_prefix_caching=*/true, block_size, /*num_layers=*/1);
+    block_manager.set_overwritten_block_observer(offload_cache.get());
+
+    const std::vector<int64_t> tokens = {0, 1, 2, 3, 4, 5, 6, 7};
+    auto producer = make_group(tokens, /*request_id=*/8);
+    producer->schedule_tokens(tokens.size());
+    block_manager.append_slots(producer);
+    producer->finish_iteration();
+    block_manager.free_sequence(producer->get_running_sequences().at(0)->get_id());
+
+    // Simulate device memory pressure: an unrelated sequence forces the cached prefix out of the
+    // (2-block) device pool, pushing its contents into the L1 host pool.
+    const std::vector<int64_t> pressure_tokens = {40, 41, 42, 43, 44, 45, 46, 47};
+    auto pressure = make_group(pressure_tokens, /*request_id=*/9);
+    pressure->schedule_tokens(pressure_tokens.size());
+    block_manager.append_slots(pressure);
+    const auto pressure_seq_id = pressure->get_running_sequences().at(0)->get_id();
+    offload_cache->flush();
+    ASSERT_GT(offload_cache->get_num_host_entries(), 0);
+    block_manager.free_sequence(pressure_seq_id);
+
+    auto consumer = make_group(tokens, /*request_id=*/10);
+    size_t num_warmed = 0;
+    {
+        KVCacheOffloadCache::ScopedReclamationPause keep_entries(*offload_cache);
+        num_warmed = block_manager.warm_prefix_cache(consumer, *offload_cache);
+    }
+
+    EXPECT_GT(num_warmed, 0);
+    // The whole point of this test: the restore came from L1, not from a disk read.
+    EXPECT_GT(offload_cache->get_statistics().num_load_host, 0);
+    EXPECT_EQ(offload_cache->get_statistics().num_load_disk, 0);
+    // The warmed blocks are unowned, so the regular restore path can now claim them, and the request
+    // ends up with processed tokens regardless of which tier served the restore.
+    EXPECT_TRUE(block_manager.restore_cached_blocks(consumer));
+    EXPECT_GT(consumer->get_num_processed_tokens(), 0);
+
+    block_manager.set_overwritten_block_observer(nullptr);
+    block_manager.free_sequence(consumer->get_running_sequences().at(0)->get_id());
+}
+
 TEST(TestKVCacheOffloadCache, WarmPrefixCacheIsNoOpWithoutEntries) {
     constexpr size_t block_size = 4;
     CacheFixture fixture(/*num_blocks=*/2);
