@@ -176,43 +176,63 @@ void KVCacheOffloadManager::remove_persisted_cache(const std::filesystem::path& 
 
 KVCacheOffloadManager::KVCacheOffloadManager(const KVCacheDiskLayout& layout,
                                              const CacheOffloadConfig& config,
-                                             const std::string& device,
                                              uint64_t tenant_isolation_seed)
-    : m_layout(layout), m_persistent(config.enable_persistence), m_tenant_isolation_seed(tenant_isolation_seed) {
-    OPENVINO_ASSERT(is_supported_device(device),
-                    "KV cache disk offload is implemented for CPU and GPU, but the inference device is '",
-                    device,
-                    "'");
-    OPENVINO_ASSERT(config.use_page_cache,
-                    "KV cache disk offload with direct I/O is not implemented yet, set use_page_cache to true");
-
+    : m_layout(layout), m_tenant_isolation_seed(tenant_isolation_seed) {
     m_slot_size = m_layout.get_slot_size();
     OPENVINO_ASSERT(m_slot_size > 0, "KV cache offload slot size must be greater than 0");
+    m_layer_spans.reserve(m_layout.get_num_layers());
+    for (size_t layer = 0; layer < m_layout.get_num_layers(); ++layer) {
+        const auto key = m_layout.get_key_segment(layer);
+        const auto value = m_layout.get_value_segment(layer);
+        OPENVINO_ASSERT(key.offset + key.size == value.offset,
+                        "KV cache disk layout expects each layer's value segment to immediately follow "
+                        "its key segment");
+        m_layer_spans.emplace_back(key.offset, key.size + value.size);
+    }
 
-    m_num_slots = config.capacity_bytes / m_slot_size;
+    StorageModelMetadata metadata;
+    metadata.model_fingerprint = config.model_fingerprint;
+    metadata.tokenizer_hash = config.tokenizer_fingerprint;
+    metadata.num_layers = m_layout.get_num_layers();
+
+    const size_t effective_capacity_bytes =
+        config.capacity_bytes > 0 ? config.capacity_bytes : config.storage_cache_size * 1024ULL * 1024ULL * 1024ULL;
+    m_num_slots = effective_capacity_bytes / m_slot_size;
     OPENVINO_ASSERT(m_num_slots > 0,
                     "KV cache offload capacity of ",
-                    config.capacity_bytes,
+                    effective_capacity_bytes,
                     " bytes is smaller than a single cache block of ",
                     m_slot_size,
                     " bytes");
 
+    initialize(config.storage_cache_dir, metadata, config.storage_plugin_properties);
+
+    m_persistent = config.enable_persistence;
     if (m_persistent) {
-        OPENVINO_ASSERT(!config.path.empty(),
-                        "KV cache offload persistence requires an explicit directory (CacheOffloadConfig::path); "
-                        "the system temporary directory is not appropriate for data meant to outlive the run");
+        OPENVINO_ASSERT(!config.storage_cache_dir.empty(),
+                        "KV cache offload persistence requires an explicit directory "
+                        "(CacheOffloadConfig::storage_cache_dir); the system temporary directory is not "
+                        "appropriate for data meant to outlive the run");
         OPENVINO_ASSERT(!config.model_fingerprint.empty() && !config.tokenizer_fingerprint.empty(),
                         "KV cache offload persistence requires non-empty model_fingerprint and tokenizer_fingerprint");
     }
+    OPENVINO_ASSERT(config.use_page_cache,
+                    "KV cache disk offload with direct I/O is not implemented yet, set use_page_cache to true");
+    OPENVINO_ASSERT(config.storage_backend_type == "default",
+                    "KV cache offload storage_backend_type '",
+                    config.storage_backend_type,
+                    "' is not supported yet (see new_plan.md Phase 4); only 'default' is implemented");
+    OPENVINO_ASSERT(config.storage_plugin_path.empty(),
+                    "KV cache offload storage_plugin_path is not supported yet (see new_plan.md Phase 4)");
 
     std::filesystem::path directory;
-    if (config.path.empty()) {
+    if (config.storage_cache_dir.empty()) {
         directory = std::filesystem::temp_directory_path();
     } else {
-        directory = std::filesystem::path(config.path);
+        directory = std::filesystem::path(config.storage_cache_dir);
         OPENVINO_ASSERT(std::filesystem::is_directory(directory),
                         "KV cache offload path '",
-                        config.path,
+                        config.storage_cache_dir,
                         "' is not an existing directory");
     }
 
@@ -226,7 +246,7 @@ KVCacheOffloadManager::KVCacheOffloadManager(const KVCacheDiskLayout& layout,
         }
 
         std::vector<bool> occupied(m_num_slots, false);
-        for (const auto& entry : m_recovered_entries) {
+        for (const auto& entry : m_hash_to_slot) {
             occupied[entry.second] = true;
         }
         m_free_slots.reserve(m_num_slots);
@@ -267,6 +287,23 @@ KVCacheOffloadManager::KVCacheOffloadManager(const KVCacheDiskLayout& layout,
     for (size_t slot_id = m_num_slots; slot_id > 0; --slot_id) {
         m_free_slots.push_back(slot_id - 1);
     }
+}
+
+void KVCacheOffloadManager::initialize(const std::string& storage_path,
+                                       const StorageModelMetadata& metadata,
+                                       const ov::AnyMap& custom_properties) {
+    // Construction already performs the real setup (see the constructor above): the byte layout comes
+    // from the KVCacheDiskLayout given at construction time, not from `metadata`'s (necessarily coarser,
+    // uniform-layer-size) fields, which exist for interface parity with a future third-party plugin that
+    // has no access to that C++ type. Only a consistency sanity check is done here.
+    OPENVINO_ASSERT(metadata.num_layers == 0 || metadata.num_layers == m_layout.get_num_layers(),
+                    "KV cache offload metadata.num_layers (",
+                    metadata.num_layers,
+                    ") does not match the configured layout (",
+                    m_layout.get_num_layers(),
+                    ")");
+    (void)storage_path;
+    (void)custom_properties;
 }
 
 bool KVCacheOffloadManager::try_recover_persisted_cache(const CacheOffloadConfig& config) {
@@ -336,13 +373,14 @@ bool KVCacheOffloadManager::try_recover_persisted_cache(const CacheOffloadConfig
         std::memcpy(&valid, record.data() + 16, sizeof(valid));
         if (valid == 1) {
             m_slot_checksums[slot_id] = recorded_checksum;
-            m_recovered_entries.emplace_back(static_cast<size_t>(recorded_hash), slot_id);
+            m_hash_to_slot[recorded_hash] = slot_id;
+            m_recovered_hashes.push_back(recorded_hash);
         }
     }
 
     GENAI_INFO("[KV_TRACE] KVCacheOffloadManager recover_persisted_cache slots=%zu recovered=%zu",
                m_num_slots,
-               m_recovered_entries.size());
+               m_recovered_hashes.size());
     return true;
 }
 
@@ -355,7 +393,8 @@ void KVCacheOffloadManager::create_fresh_persisted_files(const CacheOffloadConfi
         close_file(m_fd);
         m_fd = -1;
     }
-    m_recovered_entries.clear();
+    m_recovered_hashes.clear();
+    m_hash_to_slot.clear();
     std::fill(m_slot_checksums.begin(), m_slot_checksums.end(), 0);
 
     m_fd = create_or_truncate_file(m_file_path);
@@ -411,6 +450,10 @@ void KVCacheOffloadManager::create_fresh_persisted_files(const CacheOffloadConfi
 }
 
 KVCacheOffloadManager::~KVCacheOffloadManager() {
+    shutdown();
+}
+
+void KVCacheOffloadManager::shutdown() {
     if (m_persistent) {
         // Files intentionally survive the process so a later run can recover them; only release the fds.
         if (m_manifest_fd >= 0) {
@@ -443,60 +486,195 @@ size_t KVCacheOffloadManager::get_num_free_slots() const {
     return m_free_slots.size();
 }
 
-std::optional<size_t> KVCacheOffloadManager::acquire_slot() {
+bool KVCacheOffloadManager::has_block(uint64_t block_hash) const {
     std::lock_guard<std::mutex> lock(m_mutex);
-    if (m_free_slots.empty()) {
-        return std::nullopt;
+    return m_hash_to_slot.find(block_hash) != m_hash_to_slot.end();
+}
+
+std::vector<bool> KVCacheOffloadManager::has_blocks(const std::vector<uint64_t>& block_hashes) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<bool> result(block_hashes.size(), false);
+    for (size_t i = 0; i < block_hashes.size(); ++i) {
+        result[i] = m_hash_to_slot.find(block_hashes[i]) != m_hash_to_slot.end();
     }
-    const size_t slot_id = m_free_slots.back();
-    m_free_slots.pop_back();
-    GENAI_INFO("[KV_TRACE] KVCacheOffloadManager acquire_slot slot=%zu free_after=%zu",
-               slot_id,
-               m_free_slots.size());
-    return slot_id;
+    return result;
 }
 
-void KVCacheOffloadManager::release_slot(size_t slot_id) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    OPENVINO_ASSERT(slot_id < m_num_slots, "Invalid KV cache offload slot ", slot_id);
-    OPENVINO_ASSERT(std::find(m_free_slots.begin(), m_free_slots.end(), slot_id) == m_free_slots.end(),
-                    "KV cache offload slot ",
-                    slot_id,
-                    " is released twice");
-    m_free_slots.push_back(slot_id);
-    GENAI_INFO("[KV_TRACE] KVCacheOffloadManager release_slot slot=%zu free_after=%zu",
-               slot_id,
-               m_free_slots.size());
+namespace {
+
+/// Groups a batch of per-layer requests by block_hash, validating that each group covers every layer
+/// exactly once (the whole-block-per-call contract `IKVCacheStorageBackend` documents).
+std::unordered_map<uint64_t, std::vector<const BlockIORequest*>> group_by_hash(
+    const std::vector<BlockIORequest>& requests,
+    size_t num_layers) {
+    std::unordered_map<uint64_t, std::vector<const BlockIORequest*>> groups;
+    for (const auto& request : requests) {
+        groups[request.block_hash].push_back(&request);
+    }
+    for (const auto& [hash, group] : groups) {
+        OPENVINO_ASSERT(group.size() == num_layers,
+                        "KV cache offload expects exactly ",
+                        num_layers,
+                        " layer requests for hash ",
+                        hash,
+                        " in one call, got ",
+                        group.size());
+        std::vector<bool> seen_layers(num_layers, false);
+        for (const auto* request : group) {
+            OPENVINO_ASSERT(request->layer_idx < num_layers, "Invalid KV cache offload layer_idx ", request->layer_idx);
+            OPENVINO_ASSERT(!seen_layers[request->layer_idx],
+                            "KV cache offload got duplicate layer_idx ",
+                            request->layer_idx,
+                            " for hash ",
+                            hash);
+            seen_layers[request->layer_idx] = true;
+        }
+    }
+    return groups;
 }
 
-void KVCacheOffloadManager::write_slot(size_t slot_id, const std::vector<uint8_t>& block_data, std::optional<size_t> hash) {
-    OPENVINO_ASSERT(slot_id < m_num_slots, "Invalid KV cache offload slot ", slot_id);
-    OPENVINO_ASSERT(block_data.size() == m_slot_size,
-                    "Unexpected KV cache offload block size: got ",
-                    block_data.size(),
-                    ", expected ",
-                    m_slot_size);
+}  // namespace
+
+bool KVCacheOffloadManager::write_blocks(const std::vector<BlockIORequest>& requests) {
+    if (requests.empty()) {
+        return true;
+    }
+    const auto groups = group_by_hash(requests, m_layer_spans.size());
 
     std::lock_guard<std::mutex> lock(m_mutex);
-    GENAI_INFO("[KV_TRACE] KVCacheOffloadManager write_slot slot=%zu offset=%zu bytes=%zu",
-               slot_id,
-               m_layout.get_slot_offset(slot_id),
-               block_data.size());
-    write_at(m_fd, m_layout.get_slot_offset(slot_id), block_data.data(), m_slot_size);
-    const uint64_t checksum = fnv1a_64(block_data.data(), block_data.size());
-    m_slot_checksums[slot_id] = checksum;
+    for (const auto& [hash, group] : groups) {
+        size_t slot_id;
+        auto existing = m_hash_to_slot.find(hash);
+        if (existing != m_hash_to_slot.end()) {
+            slot_id = existing->second;
+        } else {
+            OPENVINO_ASSERT(!m_free_slots.empty(),
+                            "KV cache offload write_blocks called for a new hash with no free slots; "
+                            "the caller must evict before writing when at capacity");
+            slot_id = m_free_slots.back();
+            m_free_slots.pop_back();
+            m_hash_to_slot[hash] = slot_id;
+        }
 
-    if (m_persistent && hash.has_value()) {
-        fsync_file(m_fd);
-        write_manifest_record(slot_id, *hash, checksum);
+        const size_t slot_offset = m_layout.get_slot_offset(slot_id);
+        uint64_t checksum = 0xcbf29ce484222325ULL;
+        // Sorted by layer_idx so the whole-block checksum is independent of the caller's request order.
+        std::vector<const BlockIORequest*> ordered(group);
+        std::sort(ordered.begin(), ordered.end(), [](const BlockIORequest* a, const BlockIORequest* b) {
+            return a->layer_idx < b->layer_idx;
+        });
+        for (const auto* request : ordered) {
+            const auto& span = m_layer_spans[request->layer_idx];
+            OPENVINO_ASSERT(request->buffer_size_bytes == span.second,
+                            "Unexpected KV cache offload layer size for layer ",
+                            request->layer_idx,
+                            ": got ",
+                            request->buffer_size_bytes,
+                            ", expected ",
+                            span.second);
+            const auto* data = static_cast<const uint8_t*>(request->host_buffer);
+            write_at(m_fd, slot_offset + span.first, data, request->buffer_size_bytes);
+            checksum = fnv1a_64(data, request->buffer_size_bytes, checksum);
+        }
+        m_slot_checksums[slot_id] = checksum;
+        GENAI_INFO("[KV_TRACE] KVCacheOffloadManager write_blocks hash=%llu slot=%zu layers=%zu",
+                   static_cast<unsigned long long>(hash),
+                   slot_id,
+                   ordered.size());
+
+        if (m_persistent) {
+            fsync_file(m_fd);
+            write_manifest_record(slot_id, hash, checksum);
+        }
+    }
+    return true;
+}
+
+bool KVCacheOffloadManager::read_blocks(const std::vector<BlockIORequest>& requests) {
+    if (requests.empty()) {
+        return true;
+    }
+    const auto groups = group_by_hash(requests, m_layer_spans.size());
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& [hash, group] : groups) {
+        auto it = m_hash_to_slot.find(hash);
+        if (it == m_hash_to_slot.end()) {
+            return false;
+        }
+        const size_t slot_id = it->second;
+        const size_t slot_offset = m_layout.get_slot_offset(slot_id);
+
+        std::vector<const BlockIORequest*> ordered(group);
+        std::sort(ordered.begin(), ordered.end(), [](const BlockIORequest* a, const BlockIORequest* b) {
+            return a->layer_idx < b->layer_idx;
+        });
+        uint64_t checksum = 0xcbf29ce484222325ULL;
+        for (const auto* request : ordered) {
+            const auto& span = m_layer_spans[request->layer_idx];
+            OPENVINO_ASSERT(request->buffer_size_bytes == span.second,
+                            "Unexpected KV cache offload layer size for layer ",
+                            request->layer_idx,
+                            ": got ",
+                            request->buffer_size_bytes,
+                            ", expected ",
+                            span.second);
+            auto* data = static_cast<uint8_t*>(request->host_buffer);
+            read_at(m_fd, slot_offset + span.first, data, request->buffer_size_bytes);
+            checksum = fnv1a_64(data, request->buffer_size_bytes, checksum);
+        }
+        if (checksum != m_slot_checksums[slot_id]) {
+            GENAI_WARN("KV cache offload slot %zu (hash %llu) failed its integrity check; contents may be corrupted",
+                       slot_id,
+                       static_cast<unsigned long long>(hash));
+            return false;
+        }
+        GENAI_INFO("[KV_TRACE] KVCacheOffloadManager read_blocks hash=%llu slot=%zu layers=%zu",
+                   static_cast<unsigned long long>(hash),
+                   slot_id,
+                   ordered.size());
+    }
+    return true;
+}
+
+void KVCacheOffloadManager::evict_blocks(const std::vector<uint64_t>& block_hashes) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto hash : block_hashes) {
+        auto it = m_hash_to_slot.find(hash);
+        if (it == m_hash_to_slot.end()) {
+            continue;
+        }
+        const size_t slot_id = it->second;
+        m_hash_to_slot.erase(it);
+        m_free_slots.push_back(slot_id);
+        if (m_persistent) {
+            mark_manifest_invalid(slot_id);
+        }
+        GENAI_INFO("[KV_TRACE] KVCacheOffloadManager evict_blocks hash=%llu slot=%zu free_after=%zu",
+                   static_cast<unsigned long long>(hash),
+                   slot_id,
+                   m_free_slots.size());
     }
 }
 
-void KVCacheOffloadManager::write_manifest_record(size_t slot_id, size_t hash, uint64_t checksum) {
+void KVCacheOffloadManager::flush_manifest() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_persistent && m_manifest_fd >= 0) {
+        fsync_file(m_manifest_fd);
+    }
+}
+
+void KVCacheOffloadManager::mark_manifest_invalid(size_t slot_id) {
+    const size_t offset = MANIFEST_HEADER_SIZE + slot_id * MANIFEST_RECORD_SIZE + 16;
+    const uint32_t valid = 0;
+    write_at(m_manifest_fd, offset, reinterpret_cast<const uint8_t*>(&valid), sizeof(valid));
+    fsync_file(m_manifest_fd);
+}
+
+void KVCacheOffloadManager::write_manifest_record(size_t slot_id, uint64_t hash, uint64_t checksum) {
     const size_t offset = MANIFEST_HEADER_SIZE + slot_id * MANIFEST_RECORD_SIZE;
     uint8_t body[16];
-    const uint64_t hash64 = static_cast<uint64_t>(hash);
-    std::memcpy(body + 0, &hash64, sizeof(hash64));
+    std::memcpy(body + 0, &hash, sizeof(hash));
     std::memcpy(body + 8, &checksum, sizeof(checksum));
     write_at(m_manifest_fd, offset, body, sizeof(body));
     // Durable before the valid flag flips, so a crash in between leaves the slot reading back as absent
@@ -506,23 +684,6 @@ void KVCacheOffloadManager::write_manifest_record(size_t slot_id, size_t hash, u
     const uint32_t valid = 1;
     write_at(m_manifest_fd, offset + 16, reinterpret_cast<const uint8_t*>(&valid), sizeof(valid));
     fsync_file(m_manifest_fd);
-}
-
-void KVCacheOffloadManager::read_slot(size_t slot_id, std::vector<uint8_t>& block_data) const {
-    OPENVINO_ASSERT(slot_id < m_num_slots, "Invalid KV cache offload slot ", slot_id);
-    block_data.resize(m_slot_size);
-
-    std::lock_guard<std::mutex> lock(m_mutex);
-    GENAI_INFO("[KV_TRACE] KVCacheOffloadManager read_slot slot=%zu offset=%zu bytes=%zu",
-               slot_id,
-               m_layout.get_slot_offset(slot_id),
-               m_slot_size);
-    read_at(m_fd, m_layout.get_slot_offset(slot_id), block_data.data(), m_slot_size);
-    const uint64_t actual_checksum = fnv1a_64(block_data.data(), block_data.size());
-    OPENVINO_ASSERT(actual_checksum == m_slot_checksums[slot_id],
-                    "KV cache offload slot ",
-                    slot_id,
-                    " failed its integrity check; contents may be corrupted");
 }
 
 void KVCacheOffloadManager::write_at(int fd, size_t offset, const uint8_t* data, size_t size) const {

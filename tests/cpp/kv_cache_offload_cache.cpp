@@ -4,8 +4,11 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "continuous_batching/cache/block_manager.hpp"
@@ -57,8 +60,7 @@ CacheOffloadConfig make_offload_config(const CacheFixture& fixture, size_t num_s
 
 std::unique_ptr<KVCacheOffloadCache> make_offload_cache(CacheFixture& fixture, size_t num_slots) {
     auto backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(),
-                                                           make_offload_config(fixture, num_slots),
-                                                           "CPU");
+                                                           make_offload_config(fixture, num_slots));
     return std::make_unique<KVCacheOffloadCache>(*fixture.cache_manager, std::move(backend), /*max_queued_stores=*/8);
 }
 
@@ -66,8 +68,7 @@ std::unique_ptr<KVCacheOffloadCache> make_offload_cache_with_host_pool(CacheFixt
                                                                        size_t num_slots,
                                                                        size_t host_cache_slots) {
     auto backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(),
-                                                           make_offload_config(fixture, num_slots),
-                                                           "CPU");
+                                                           make_offload_config(fixture, num_slots));
     return std::make_unique<KVCacheOffloadCache>(*fixture.cache_manager,
                                                  std::move(backend),
                                                  /*max_queued_stores=*/8,
@@ -83,21 +84,82 @@ BlocksPerLayer make_block_set(int physical_block_id) {
 /// Minimal third-party-style IKVCacheStorageBackend: proves KVCacheOffloadCache's hash index, LRU
 /// eviction and store/load orchestration live entirely on the KVCacheOffloadCache side of the seam, with
 /// zero dependency on the file-based DefaultFileStorageBackend (KVCacheOffloadManager). Does not support
-/// persistence (get_recovered_entries() is always empty), matching a plugin that declares no such
-/// capability.
+/// persistence (get_recovered_hashes() is always empty), matching a plugin that declares no such
+/// capability. Stores each layer's bytes separately (indexed by layer_idx) rather than assuming a single
+/// flat per-slot byte layout, since it has no access to the real KVCacheDiskLayout.
 class InMemoryMockStorageBackend : public IKVCacheStorageBackend {
 public:
-    InMemoryMockStorageBackend(std::size_t slot_size, std::size_t num_slots)
-        : m_slot_size(slot_size), m_slots(num_slots) {
+    explicit InMemoryMockStorageBackend(std::size_t num_slots) : m_slots(num_slots) {
         m_free_slots.reserve(num_slots);
         for (std::size_t i = num_slots; i-- > 0;) {
             m_free_slots.push_back(i);
         }
     }
 
-    std::size_t get_slot_size() const override {
-        return m_slot_size;
+    void initialize(const std::string&, const StorageModelMetadata&, const ov::AnyMap&) override {}
+
+    bool has_block(std::uint64_t block_hash) const override {
+        return m_hash_to_slot.find(block_hash) != m_hash_to_slot.end();
     }
+
+    std::vector<bool> has_blocks(const std::vector<std::uint64_t>& block_hashes) const override {
+        std::vector<bool> result(block_hashes.size());
+        for (std::size_t i = 0; i < block_hashes.size(); ++i) {
+            result[i] = has_block(block_hashes[i]);
+        }
+        return result;
+    }
+
+    bool write_blocks(const std::vector<BlockIORequest>& requests) override {
+        for (const auto& request : requests) {
+            std::size_t slot_id;
+            auto existing = m_hash_to_slot.find(request.block_hash);
+            if (existing != m_hash_to_slot.end()) {
+                slot_id = existing->second;
+            } else {
+                OPENVINO_ASSERT(!m_free_slots.empty());
+                slot_id = m_free_slots.back();
+                m_free_slots.pop_back();
+                m_hash_to_slot[request.block_hash] = slot_id;
+            }
+            auto& layers = m_slots[slot_id];
+            if (layers.size() <= request.layer_idx) {
+                layers.resize(request.layer_idx + 1);
+            }
+            const auto* data = static_cast<const uint8_t*>(request.host_buffer);
+            layers[request.layer_idx].assign(data, data + request.buffer_size_bytes);
+            ++num_writes;
+        }
+        return true;
+    }
+
+    bool read_blocks(const std::vector<BlockIORequest>& requests) override {
+        for (const auto& request : requests) {
+            auto it = m_hash_to_slot.find(request.block_hash);
+            if (it == m_hash_to_slot.end()) {
+                return false;
+            }
+            const auto& layer_data = m_slots[it->second].at(request.layer_idx);
+            OPENVINO_ASSERT(layer_data.size() == request.buffer_size_bytes);
+            auto* data = static_cast<uint8_t*>(request.host_buffer);
+            std::copy(layer_data.begin(), layer_data.end(), data);
+        }
+        return true;
+    }
+
+    void evict_blocks(const std::vector<std::uint64_t>& block_hashes) override {
+        for (const auto hash : block_hashes) {
+            auto it = m_hash_to_slot.find(hash);
+            if (it == m_hash_to_slot.end()) {
+                continue;
+            }
+            m_free_slots.push_back(it->second);
+            m_hash_to_slot.erase(it);
+        }
+    }
+
+    void flush_manifest() override {}
+    void shutdown() override {}
 
     std::size_t get_num_slots() const override {
         return m_slots.size();
@@ -107,37 +169,8 @@ public:
         return m_free_slots.size();
     }
 
-    std::optional<std::size_t> acquire_slot() override {
-        if (m_free_slots.empty()) {
-            return std::nullopt;
-        }
-        const std::size_t slot_id = m_free_slots.back();
-        m_free_slots.pop_back();
-        return slot_id;
-    }
-
-    void release_slot(std::size_t slot_id) override {
-        OPENVINO_ASSERT(slot_id < m_slots.size());
-        m_free_slots.push_back(slot_id);
-    }
-
-    void write_slot(std::size_t slot_id,
-                    const std::vector<uint8_t>& data,
-                    std::optional<std::size_t> hash = std::nullopt) override {
-        OPENVINO_ASSERT(slot_id < m_slots.size());
-        OPENVINO_ASSERT(data.size() == m_slot_size);
-        m_slots[slot_id] = data;
-        ++num_writes;
-        (void)hash;
-    }
-
-    void read_slot(std::size_t slot_id, std::vector<uint8_t>& data) const override {
-        OPENVINO_ASSERT(slot_id < m_slots.size());
-        data = m_slots[slot_id];
-    }
-
-    const std::vector<std::pair<std::size_t, std::size_t>>& get_recovered_entries() const override {
-        static const std::vector<std::pair<std::size_t, std::size_t>> empty;
+    const std::vector<std::uint64_t>& get_recovered_hashes() const override {
+        static const std::vector<std::uint64_t> empty;
         return empty;
     }
 
@@ -148,14 +181,13 @@ public:
     std::size_t num_writes = 0;
 
 private:
-    std::size_t m_slot_size;
-    std::vector<std::vector<uint8_t>> m_slots;
+    std::vector<std::vector<std::vector<uint8_t>>> m_slots;  // [slot_id][layer_idx] -> bytes
     std::vector<std::size_t> m_free_slots;
+    std::unordered_map<std::uint64_t, std::size_t> m_hash_to_slot;
 };
 
 std::unique_ptr<KVCacheOffloadCache> make_offload_cache_with_mock_backend(CacheFixture& fixture, size_t num_slots) {
-    auto backend = std::make_unique<InMemoryMockStorageBackend>(fixture.cache_manager->get_block_layout().get_slot_size(),
-                                                                 num_slots);
+    auto backend = std::make_unique<InMemoryMockStorageBackend>(num_slots);
     return std::make_unique<KVCacheOffloadCache>(*fixture.cache_manager, std::move(backend), /*max_queued_stores=*/8);
 }
 
@@ -348,8 +380,7 @@ TEST(TestKVCacheOffloadCache, StoresBlockContentsOnOverwrite) {
 TEST(TestKVCacheOffloadCache, RejectsExcessiveBufferSlots) {
     CacheFixture fixture;
     auto backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(),
-                                                           make_offload_config(fixture, 1),
-                                                           "CPU");
+                                                           make_offload_config(fixture, 1));
 
     EXPECT_THROW(KVCacheOffloadCache(*fixture.cache_manager,
                                      std::move(backend),
@@ -820,14 +851,14 @@ TEST(TestKVCacheOffloadCache, RecoversEntriesFromPersistedCacheAcrossRestart) {
 
     CacheFixture fixture;
     CacheOffloadConfig config = make_offload_config(fixture, /*num_slots=*/2);
-    config.path = directory.string();
+    config.storage_cache_dir = directory.string();
     config.enable_persistence = true;
     config.model_fingerprint = "model-x";
     config.tokenizer_fingerprint = "tokenizer-x";
 
     const auto expected = fixture.fill_block(0, /*seed=*/3);
     {
-        auto backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(), config, "CPU");
+        auto backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(), config);
         KVCacheOffloadCache offload_cache(*fixture.cache_manager, std::move(backend), /*max_queued_stores=*/8);
         offload_cache.on_blocks_overwritten(/*hash=*/21, make_block_set(0));
         offload_cache.flush();
@@ -835,8 +866,8 @@ TEST(TestKVCacheOffloadCache, RecoversEntriesFromPersistedCacheAcrossRestart) {
         // offload_cache and its backend destruct here; the persisted files must survive.
     }
 
-    auto reopened_backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(), config, "CPU");
-    ASSERT_EQ(reopened_backend->get_recovered_entries().size(), 1u);
+    auto reopened_backend = std::make_unique<KVCacheOffloadManager>(fixture.cache_manager->get_block_layout(), config);
+    ASSERT_EQ(reopened_backend->get_recovered_hashes().size(), 1u);
     {
         KVCacheOffloadCache reopened_cache(*fixture.cache_manager, std::move(reopened_backend), /*max_queued_stores=*/8);
 
@@ -876,7 +907,7 @@ TEST(TestKVCacheOffloadCache, WorksWithThirdPartyStorageBackend) {
 }
 
 TEST(TestKVCacheOffloadCache, EvictionAndMissPolicyAreBackendAgnostic) {
-    // The mock backend has no eviction logic of its own (release_slot() only returns the slot to a free
+    // The mock backend has no eviction logic of its own (evict_blocks() only returns the slot to a free
     // list); LRU replacement and miss reporting must therefore be entirely KVCacheOffloadCache's doing.
     CacheFixture fixture;
     auto offload_cache = make_offload_cache_with_mock_backend(fixture, /*num_slots=*/1);

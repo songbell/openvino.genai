@@ -60,7 +60,7 @@ SchedulerConfig make_scheduler_config(bool use_offload) {
     config.max_num_seqs = 4;
     config.dynamic_split_fuse = false;
     config.enable_prefix_caching = true;
-    config.use_cache_offload = use_offload;
+    config.enable_kv_cache_offloading = use_offload;
     if (use_offload) {
         // Room for far more blocks than the device cache holds, so eviction lands on disk.
         config.cache_offload_config.capacity_bytes = 8u * 1024u * 1024u;

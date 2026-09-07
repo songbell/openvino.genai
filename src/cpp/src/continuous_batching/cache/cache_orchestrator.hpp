@@ -101,7 +101,7 @@ public:
 
         OPENVINO_ASSERT(orchestrator->has_registered_types(), "No supported cache types detected in the model");
 
-        if (config.use_cache_offload) {
+        if (config.enable_kv_cache_offloading) {
             // tenant_isolation_seed intentionally left at its default (0): tenant identity now lives on
             // GenerationConfig (per-request), but the offload manifest is pipeline-scoped; a proper
             // per-tenant persisted-cache story needs the Phase 3 storage-interface rework.
@@ -119,13 +119,14 @@ public:
         auto cache_mgr_it = m_cache_managers.find(CacheType::KV_CACHE);
         OPENVINO_ASSERT(cache_mgr_it != m_cache_managers.end(),
                         "KV cache offload requires a model with KV cache inputs");
+        OPENVINO_ASSERT(KVCacheOffloadManager::is_supported_device(device),
+                        "KV cache offload is not supported on device ", device);
 
         auto& kv_manager = static_cast<KVCacheManager&>(*cache_mgr_it->second);
-        auto backend = std::make_unique<KVCacheOffloadManager>(kv_manager.get_block_layout(), offload_config, device,
+        auto backend = std::make_unique<KVCacheOffloadManager>(kv_manager.get_block_layout(), offload_config,
                                                                tenant_isolation_seed);
-        GENAI_INFO("[KV_TRACE] kv_cache_offload backend=%s slot_bytes=%zu slots=%zu",
+        GENAI_INFO("[KV_TRACE] kv_cache_offload backend=%s slots=%zu",
                    backend->describe().c_str(),
-                   backend->get_slot_size(),
                    backend->get_num_slots());
 
         m_kv_offload_cache = std::make_unique<KVCacheOffloadCache>(kv_manager,

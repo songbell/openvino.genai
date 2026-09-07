@@ -10,6 +10,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -142,20 +143,18 @@ public:
 
 private:
     struct Entry {
-        std::size_t slot_id = 0;
         std::list<std::size_t>::iterator order_it;
     };
 
     /// A block whose contents are already copied out but not yet on disk.
     struct QueuedStore {
         std::size_t hash = 0;
-        std::size_t slot_id = 0;
         bool reclaimed = false;
         std::vector<uint8_t> data;
     };
 
-    /// @return A slot freed by dropping the oldest entry, or std::nullopt when there is nothing to drop.
-    std::optional<std::size_t> reclaim_oldest_slot();
+    /// @return The hash freed by dropping the oldest entry, or std::nullopt when there is nothing to drop.
+    std::optional<std::size_t> reclaim_oldest_hash();
 
     const QueuedStore* find_queued(std::size_t hash) const;
 
@@ -169,7 +168,13 @@ private:
     /// device. Caller must already hold `m_mutex`.
     bool resolve_unlocked(std::size_t hash, std::vector<uint8_t>& destination);
 
-    void publish(std::size_t hash, std::size_t slot_id, bool reclaimed);
+    /// @return One `BlockIORequest` per layer, pointing into (sub-spans of) @p buffer, which must already
+    /// be sized to the full multi-layer block (`m_cache_manager.get_block_layout().get_slot_size()`).
+    /// Used for both writes (buffer already holds the data) and reads (buffer is the destination the
+    /// backend fills in-place).
+    std::vector<BlockIORequest> make_requests(std::uint64_t hash, std::vector<uint8_t>& buffer) const;
+
+    void publish(std::size_t hash, bool reclaimed);
 
     void run_writer();
 

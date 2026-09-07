@@ -47,17 +47,14 @@ KVCacheOffloadCache::KVCacheOffloadCache(KVCacheManager& cache_manager,
     OPENVINO_ASSERT(m_max_queued_stores > 0, "KV cache offload needs at least one staging buffer");
     OPENVINO_ASSERT(m_max_queued_stores <= CACHE_OFFLOAD_MAX_BUFFER_SLOTS,
                     "KV cache offload buffer_slots must not exceed ", CACHE_OFFLOAD_MAX_BUFFER_SLOTS);
-    OPENVINO_ASSERT(m_backend->get_slot_size() == m_cache_manager.get_block_layout().get_slot_size(),
-                    "KV cache offload backend slot size does not match the cache block layout");
-    // Entries recovered from a compatible persisted cache are already on disk and occupy their slots;
-    // seed the in-memory index with them before starting the writer so a lookup can hit them right away.
-    // Recovery does not preserve original insertion order, so recovered entries are simply appended in
-    // whatever order the backend returned them; they age out through the same LRU as any other entry.
-    for (const auto& recovered : m_backend->get_recovered_entries()) {
-        const std::size_t hash = recovered.first;
-        const std::size_t slot_id = recovered.second;
+    OPENVINO_ASSERT(m_backend->get_num_slots() > 0, "KV cache offload backend must have at least one slot");
+    // Entries recovered from a compatible persisted cache are already on disk; seed the in-memory index
+    // with them before starting the writer so a lookup can hit them right away. Recovery does not
+    // preserve original insertion order, so recovered entries are simply appended in whatever order the
+    // backend returned them; they age out through the same LRU as any other entry.
+    for (const auto hash : m_backend->get_recovered_hashes()) {
         m_insertion_order.push_back(hash);
-        m_entries[hash] = Entry{slot_id, std::prev(m_insertion_order.end())};
+        m_entries[hash] = Entry{std::prev(m_insertion_order.end())};
     }
     m_writer = std::thread(&KVCacheOffloadCache::run_writer, this);
 }
@@ -123,24 +120,21 @@ void KVCacheOffloadCache::on_blocks_overwritten(std::size_t hash, const BlocksPe
         return;
     }
 
-    std::optional<std::size_t> slot_id = m_backend->acquire_slot();
     bool reclaimed = false;
-    if (!slot_id.has_value()) {
+    if (m_backend->get_num_free_slots() == 0) {
         if (m_reclamation_paused) {
             ++m_statistics.num_failed;
             return;
         }
-        slot_id = reclaim_oldest_slot();
-        reclaimed = slot_id.has_value();
-    }
-    if (!slot_id.has_value()) {
-        ++m_statistics.num_failed;
-        return;
+        reclaimed = reclaim_oldest_hash().has_value();
+        if (!reclaimed) {
+            ++m_statistics.num_failed;
+            return;
+        }
     }
 
     QueuedStore queued;
     queued.hash = hash;
-    queued.slot_id = *slot_id;
     queued.reclaimed = reclaimed;
     try {
         // Copy the contents out now; the block is handed over for overwriting as soon as this returns.
@@ -148,7 +142,6 @@ void KVCacheOffloadCache::on_blocks_overwritten(std::size_t hash, const BlocksPe
         queued.data = m_cache_manager.read_block(static_cast<std::size_t>(block_index));
     } catch (const std::exception& error) {
         GENAI_WARN("KV cache offload store failed for hash %zu: %s", hash, error.what());
-        m_backend->release_slot(*slot_id);
         ++m_statistics.num_failed;
         return;
     }
@@ -183,16 +176,16 @@ void KVCacheOffloadCache::run_writer() {
 
         // Only this thread pops, and deque never invalidates references to existing elements,
         // so the front entry stays readable while the mutex is released for the write.
-        const QueuedStore& front = m_queued_stores.front();
+        QueuedStore& front = m_queued_stores.front();
         const std::size_t hash = front.hash;
-        const std::size_t slot_id = front.slot_id;
         const bool reclaimed = front.reclaimed;
 
         bool stored = true;
         lock.unlock();
         const auto started = std::chrono::steady_clock::now();
         try {
-            m_backend->write_slot(slot_id, front.data, hash);
+            const auto requests = make_requests(hash, front.data);
+            stored = m_backend->write_blocks(requests);
         } catch (const std::exception& error) {
             GENAI_WARN("KV cache offload store failed for hash %zu: %s", hash, error.what());
             stored = false;
@@ -204,18 +197,39 @@ void KVCacheOffloadCache::run_writer() {
 
         m_queued_stores.pop_front();
         if (stored) {
-            publish(hash, slot_id, reclaimed);
+            publish(hash, reclaimed);
         } else {
-            m_backend->release_slot(slot_id);
             ++m_statistics.num_failed;
         }
         m_drained_cv.notify_all();
     }
 }
 
-void KVCacheOffloadCache::publish(std::size_t hash, std::size_t slot_id, bool reclaimed) {
+std::vector<BlockIORequest> KVCacheOffloadCache::make_requests(std::uint64_t hash, std::vector<uint8_t>& buffer) const {
+    const auto& layout = m_cache_manager.get_block_layout();
+    OPENVINO_ASSERT(buffer.size() == layout.get_slot_size(),
+                    "KV cache offload buffer size does not match the cache block layout");
+    std::vector<BlockIORequest> requests;
+    const std::size_t num_layers = layout.get_num_layers();
+    requests.reserve(num_layers);
+    for (std::size_t layer = 0; layer < num_layers; ++layer) {
+        const auto key_segment = layout.get_key_segment(layer);
+        const auto value_segment = layout.get_value_segment(layer);
+        OPENVINO_ASSERT(key_segment.offset + key_segment.size == value_segment.offset,
+                        "KV cache offload expects a layer's key and value segments to be adjacent");
+        BlockIORequest request;
+        request.block_hash = hash;
+        request.host_buffer = buffer.data() + key_segment.offset;
+        request.buffer_size_bytes = key_segment.size + value_segment.size;
+        request.layer_idx = static_cast<std::uint32_t>(layer);
+        requests.push_back(request);
+    }
+    return requests;
+}
+
+void KVCacheOffloadCache::publish(std::size_t hash, bool reclaimed) {
     m_insertion_order.push_back(hash);
-    m_entries[hash] = Entry{slot_id, std::prev(m_insertion_order.end())};
+    m_entries[hash] = Entry{std::prev(m_insertion_order.end())};
     ++m_statistics.num_stored;
     if (reclaimed) {
         ++m_statistics.num_replaced;
@@ -223,9 +237,8 @@ void KVCacheOffloadCache::publish(std::size_t hash, std::size_t slot_id, bool re
     // The L1 host copy was already seeded in on_blocks_overwritten; this only records disk durability and
     // must not re-touch or re-evict the independent host tier.
     if (m_enable_detailed_logging) {
-        GENAI_INFO("[KV_TRACE] KVCacheOffloadCache publish hash=%zu slot=%zu entries=%zu replaced=%s",
+        GENAI_INFO("[KV_TRACE] KVCacheOffloadCache publish hash=%zu entries=%zu replaced=%s",
                    hash,
-                   slot_id,
                    m_entries.size(),
                    reclaimed ? "true" : "false");
     }
@@ -268,17 +281,17 @@ KVCacheOffloadCache::ScopedReclamationPause::~ScopedReclamationPause() {
     m_cache.m_reclamation_paused = false;
 }
 
-std::optional<std::size_t> KVCacheOffloadCache::reclaim_oldest_slot() {
+std::optional<std::size_t> KVCacheOffloadCache::reclaim_oldest_hash() {
     if (m_insertion_order.empty()) {
         return std::nullopt;
     }
     const std::size_t oldest_hash = m_insertion_order.front();
     auto it = m_entries.find(oldest_hash);
     OPENVINO_ASSERT(it != m_entries.end(), "KV cache offload index and insertion order are out of sync");
-    const std::size_t slot_id = it->second.slot_id;
     m_insertion_order.pop_front();
     m_entries.erase(it);
-    return slot_id;
+    m_backend->evict_blocks({static_cast<std::uint64_t>(oldest_hash)});
+    return oldest_hash;
 }
 
 bool KVCacheOffloadCache::contains(std::size_t hash) const {
@@ -353,7 +366,12 @@ bool KVCacheOffloadCache::resolve_unlocked(std::size_t hash, std::vector<uint8_t
             }
             ++m_statistics.num_load_disk;
             ScopedTimer timer(m_statistics.load_disk_us);
-            m_backend->read_slot(it->second.slot_id, destination);
+            destination.resize(m_cache_manager.get_block_layout().get_slot_size());
+            const auto requests = make_requests(hash, destination);
+            if (!m_backend->read_blocks(requests)) {
+                ++m_statistics.num_failed;
+                return false;
+            }
         }
     } catch (const std::exception& error) {
         GENAI_WARN("KV cache offload resolve failed for hash %zu: %s", hash, error.what());
@@ -394,14 +412,18 @@ bool KVCacheOffloadCache::load_into_unlocked(std::size_t hash, std::size_t block
             }
             ++m_statistics.num_load_disk;
             if (m_enable_detailed_logging) {
-                GENAI_INFO("[KV_TRACE] KVCacheOffloadCache load hash=%zu source=disk slot=%zu physical_block=%zu",
+                GENAI_INFO("[KV_TRACE] KVCacheOffloadCache load hash=%zu source=disk physical_block=%zu",
                            hash,
-                           it->second.slot_id,
                            block_index);
             }
             {
                 ScopedTimer timer(m_statistics.load_disk_us);
-                m_backend->read_slot(it->second.slot_id, m_staging);
+                m_staging.resize(m_cache_manager.get_block_layout().get_slot_size());
+                const auto requests = make_requests(hash, m_staging);
+                if (!m_backend->read_blocks(requests)) {
+                    ++m_statistics.num_failed;
+                    return false;
+                }
             }
             ScopedTimer timer(m_statistics.load_write_us);
             m_cache_manager.write_block(block_index, m_staging);
@@ -433,8 +455,9 @@ bool KVCacheOffloadCache::read(std::size_t hash, std::vector<uint8_t>& block_dat
     if (it == m_entries.end()) {
         return false;
     }
-    m_backend->read_slot(it->second.slot_id, block_data);
-    return true;
+    block_data.resize(m_cache_manager.get_block_layout().get_slot_size());
+    const auto requests = make_requests(hash, block_data);
+    return m_backend->read_blocks(requests);
 }
 
 std::size_t KVCacheOffloadCache::get_num_entries() const {

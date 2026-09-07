@@ -7,8 +7,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
-#include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -22,16 +22,21 @@ namespace ov::genai {
  * @brief Fixed-slot disk backend for offloaded KV cache blocks.
  *
  * Owns a run-specific file, hands out slots sized to exactly one block set, and performs
- * length-verified reads and writes. It deliberately knows nothing about block hashes,
- * sequences or eviction policy - those stay in the block manager and the orchestrator.
+ * length-verified reads and writes. It deliberately knows nothing about sequences or eviction policy -
+ * those stay in the block manager and the orchestrator; hashes are used purely as the backend's own
+ * lookup key (`m_hash_to_slot`), never for any prefix-cache decision.
  *
- * This is openvino_genai's built-in `DefaultFileStorageBackend` (see `kv_cache_offload_new_plan.md`
- * Phase 6): the only `IKVCacheStorageBackend` implementation today, and the one
- * `KVCacheOffloadCache` falls back to when no third-party storage plugin is configured.
+ * This is openvino_genai's built-in `DefaultFileStorageBackend` (see `new_plan.md` §3.3.3): the only
+ * `IKVCacheStorageBackend` implementation today, and the one `KVCacheOffloadCache` falls back to when no
+ * third-party storage plugin is configured.
  */
 class KVCacheOffloadManager : public IKVCacheStorageBackend {
 public:
     /**
+     * @param layout Per-layer key/value byte layout of one block; used for the authoritative slot size
+     * and byte offsets. Kept as a constructor parameter (rather than derived solely from the
+     * interface's `StorageModelMetadata`, whose `block_bytes_per_layer` assumes uniform layer sizes) so
+     * this in-tree backend keeps supporting models with non-uniform per-layer KV byte sizes.
      * @param tenant_isolation_seed Recorded in the persisted manifest header (has no effect when
      * persistence is disabled). A persisted cache is only ever recovered when this matches the seed it
      * was written with, so a cache belonging to a different tenant/cache_salt (see
@@ -39,7 +44,6 @@ public:
      */
     KVCacheOffloadManager(const KVCacheDiskLayout& layout,
                           const CacheOffloadConfig& config,
-                          const std::string& device,
                           uint64_t tenant_isolation_seed = 0);
     ~KVCacheOffloadManager() override;
 
@@ -49,51 +53,29 @@ public:
     /// @return Whether KV cache offload is implemented for this inference device.
     static bool is_supported_device(const std::string& device);
 
-    /// @return Size of one slot in bytes, equal to the byte size of one block set across all layers.
-    std::size_t get_slot_size() const override {
-        return m_slot_size;
-    }
+    void initialize(const std::string& storage_path,
+                    const StorageModelMetadata& metadata,
+                    const ov::AnyMap& custom_properties) override;
 
-    /// @return Total number of slots derived from the configured capacity.
+    bool has_block(std::uint64_t block_hash) const override;
+    std::vector<bool> has_blocks(const std::vector<std::uint64_t>& block_hashes) const override;
+    bool write_blocks(const std::vector<BlockIORequest>& requests) override;
+    bool read_blocks(const std::vector<BlockIORequest>& requests) override;
+    void evict_blocks(const std::vector<std::uint64_t>& block_hashes) override;
+    void flush_manifest() override;
+    void shutdown() override;
+
     std::size_t get_num_slots() const override {
         return m_num_slots;
     }
 
     std::size_t get_num_free_slots() const override;
 
-    /// @return A free slot, or std::nullopt when the offload file is full.
-    std::optional<std::size_t> acquire_slot() override;
-
-    void release_slot(std::size_t slot_id) override;
-
-    /**
-     * @brief Writes one slot's data, computing and recording its integrity checksum.
-     * @param hash The prefix-cache hash this slot's contents belong to. Only used to persist the slot
-     * index when persistence is enabled (see `CacheOffloadConfig::enable_persistence`); the manager itself
-     * never uses it for any eviction or lookup decision. Omit it to leave the slot absent from the
-     * persisted index (it will simply not be recoverable after a restart).
-     */
-    void write_slot(std::size_t slot_id,
-                   const std::vector<uint8_t>& block_data,
-                   std::optional<std::size_t> hash = std::nullopt) override;
-
-    /**
-     * @brief Reads one slot's data and verifies it against the checksum recorded by write_slot() (or, for
-     * a slot recovered from a persisted cache, the checksum stored in the on-disk index).
-     * @throws ov::Exception if the checksum does not match, so a caller already treating I/O errors as a
-     * miss (recomputing instead of trusting corrupted bytes) gets the same safe behavior here.
-     */
-    void read_slot(std::size_t slot_id, std::vector<uint8_t>& block_data) const override;
-
-    const std::filesystem::path& get_file_path() const {
-        return m_file_path;
-    }
-
-    /// @return (hash, slot_id) pairs recovered from a compatible persisted cache at construction time.
+    /// @return Hashes recovered from a compatible persisted cache at `initialize()` time.
     /// Empty when persistence is disabled, this is the first run for this directory, or the persisted
     /// cache was incompatible (see CacheOffloadConfig::enable_persistence) and was therefore rebuilt fresh.
-    const std::vector<std::pair<std::size_t, std::size_t>>& get_recovered_entries() const override {
-        return m_recovered_entries;
+    const std::vector<std::uint64_t>& get_recovered_hashes() const override {
+        return m_recovered_hashes;
     }
 
     /// @return The offload file's path, for logging/diagnostics only.
@@ -115,9 +97,12 @@ private:
     /// unreadable, or incompatible with this run's expected header.
     bool try_recover_persisted_cache(const CacheOffloadConfig& config);
     void create_fresh_persisted_files(const CacheOffloadConfig& config);
-    void write_manifest_record(std::size_t slot_id, std::size_t hash, std::uint64_t checksum);
+    void write_manifest_record(std::size_t slot_id, std::uint64_t hash, std::uint64_t checksum);
+    void mark_manifest_invalid(std::size_t slot_id);
 
     KVCacheDiskLayout m_layout;
+    // Byte offset (within one slot) and size of each layer's combined key+value span; index = layer_idx.
+    std::vector<std::pair<std::size_t, std::size_t>> m_layer_spans;
     std::filesystem::path m_file_path;
     std::filesystem::path m_manifest_path;
     int m_fd = -1;
@@ -129,10 +114,11 @@ private:
     // on recovery so a cache from a different tenant/cache_salt is never partially reused.
     std::uint64_t m_tenant_isolation_seed = 0;
     std::vector<std::size_t> m_free_slots;
-    // Checksum of each slot's last-written contents, in-memory regardless of persistence, so read_slot()
-    // can always detect corruption; populated by write_slot() or, for a recovered slot, at construction.
+    std::unordered_map<std::uint64_t, std::size_t> m_hash_to_slot;
+    // Checksum of each slot's last-written contents, in-memory regardless of persistence, so read_blocks()
+    // can always detect corruption; populated by write_blocks() or, for a recovered slot, at initialize().
     std::vector<std::uint64_t> m_slot_checksums;
-    std::vector<std::pair<std::size_t, std::size_t>> m_recovered_entries;
+    std::vector<std::uint64_t> m_recovered_hashes;
     // Serializes slot bookkeeping and the seek/read/write pairs used on platforms without positional I/O.
     mutable std::mutex m_mutex;
 };
