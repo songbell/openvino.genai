@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "continuous_batching/cache/block_manager.hpp"
+#include "continuous_batching/cache/i_kv_cache_storage_backend.hpp"
 #include "continuous_batching/cache/kv_cache_manager.hpp"
 #include "continuous_batching/cache/kv_cache_offload_cache.hpp"
 #include "continuous_batching/cache/kv_cache_offload_manager.hpp"
@@ -77,6 +78,85 @@ std::unique_ptr<KVCacheOffloadCache> make_offload_cache_with_host_pool(CacheFixt
 
 BlocksPerLayer make_block_set(int physical_block_id) {
     return BlocksPerLayer{std::make_shared<CacheBlock>(physical_block_id)};
+}
+
+/// Minimal third-party-style IKVCacheStorageBackend: proves KVCacheOffloadCache's hash index, LRU
+/// eviction and store/load orchestration live entirely on the KVCacheOffloadCache side of the seam, with
+/// zero dependency on the file-based DefaultFileStorageBackend (KVCacheOffloadManager). Does not support
+/// persistence (get_recovered_entries() is always empty), matching a plugin that declares no such
+/// capability.
+class InMemoryMockStorageBackend : public IKVCacheStorageBackend {
+public:
+    InMemoryMockStorageBackend(std::size_t slot_size, std::size_t num_slots)
+        : m_slot_size(slot_size), m_slots(num_slots) {
+        m_free_slots.reserve(num_slots);
+        for (std::size_t i = num_slots; i-- > 0;) {
+            m_free_slots.push_back(i);
+        }
+    }
+
+    std::size_t get_slot_size() const override {
+        return m_slot_size;
+    }
+
+    std::size_t get_num_slots() const override {
+        return m_slots.size();
+    }
+
+    std::size_t get_num_free_slots() const override {
+        return m_free_slots.size();
+    }
+
+    std::optional<std::size_t> acquire_slot() override {
+        if (m_free_slots.empty()) {
+            return std::nullopt;
+        }
+        const std::size_t slot_id = m_free_slots.back();
+        m_free_slots.pop_back();
+        return slot_id;
+    }
+
+    void release_slot(std::size_t slot_id) override {
+        OPENVINO_ASSERT(slot_id < m_slots.size());
+        m_free_slots.push_back(slot_id);
+    }
+
+    void write_slot(std::size_t slot_id,
+                    const std::vector<uint8_t>& data,
+                    std::optional<std::size_t> hash = std::nullopt) override {
+        OPENVINO_ASSERT(slot_id < m_slots.size());
+        OPENVINO_ASSERT(data.size() == m_slot_size);
+        m_slots[slot_id] = data;
+        ++num_writes;
+        (void)hash;
+    }
+
+    void read_slot(std::size_t slot_id, std::vector<uint8_t>& data) const override {
+        OPENVINO_ASSERT(slot_id < m_slots.size());
+        data = m_slots[slot_id];
+    }
+
+    const std::vector<std::pair<std::size_t, std::size_t>>& get_recovered_entries() const override {
+        static const std::vector<std::pair<std::size_t, std::size_t>> empty;
+        return empty;
+    }
+
+    std::string describe() const override {
+        return "InMemoryMockStorageBackend";
+    }
+
+    std::size_t num_writes = 0;
+
+private:
+    std::size_t m_slot_size;
+    std::vector<std::vector<uint8_t>> m_slots;
+    std::vector<std::size_t> m_free_slots;
+};
+
+std::unique_ptr<KVCacheOffloadCache> make_offload_cache_with_mock_backend(CacheFixture& fixture, size_t num_slots) {
+    auto backend = std::make_unique<InMemoryMockStorageBackend>(fixture.cache_manager->get_block_layout().get_slot_size(),
+                                                                 num_slots);
+    return std::make_unique<KVCacheOffloadCache>(*fixture.cache_manager, std::move(backend), /*max_queued_stores=*/8);
 }
 
 SequenceGroup::Ptr make_group(const std::vector<int64_t>& tokens, uint64_t request_id) {
@@ -722,4 +802,53 @@ TEST(TestKVCacheOffloadCache, RecoversEntriesFromPersistedCacheAcrossRestart) {
     }
 
     std::filesystem::remove_all(directory);
+}
+
+TEST(TestKVCacheOffloadCache, WorksWithThirdPartyStorageBackend) {
+    // Proves the IKVCacheStorageBackend seam is real: KVCacheOffloadCache's hash index, publish and load
+    // orchestration behave identically when the backend is a non-file, in-memory mock rather than the
+    // built-in DefaultFileStorageBackend (KVCacheOffloadManager).
+    CacheFixture fixture;
+    auto offload_cache = make_offload_cache_with_mock_backend(fixture, /*num_slots=*/2);
+    const auto expected = fixture.fill_block(0, /*seed=*/9);
+
+    offload_cache->on_blocks_overwritten(/*hash=*/55, make_block_set(0));
+    offload_cache->flush();
+
+    EXPECT_EQ(offload_cache->get_num_entries(), 1);
+    EXPECT_TRUE(offload_cache->contains(55));
+
+    std::vector<uint8_t> restored;
+    ASSERT_TRUE(offload_cache->read(/*hash=*/55, restored));
+    EXPECT_EQ(restored, expected);
+
+    EXPECT_TRUE(offload_cache->load_into(55, /*block_index=*/1));
+    const auto loaded = fixture.cache_manager->read_block(1);
+    EXPECT_EQ(loaded, expected);
+}
+
+TEST(TestKVCacheOffloadCache, EvictionAndMissPolicyAreBackendAgnostic) {
+    // The mock backend has no eviction logic of its own (release_slot() only returns the slot to a free
+    // list); LRU replacement and miss reporting must therefore be entirely KVCacheOffloadCache's doing.
+    CacheFixture fixture;
+    auto offload_cache = make_offload_cache_with_mock_backend(fixture, /*num_slots=*/1);
+    fixture.fill_block(0, /*seed=*/1);
+    offload_cache->on_blocks_overwritten(/*hash=*/100, make_block_set(0));
+    offload_cache->flush();
+    ASSERT_EQ(offload_cache->get_num_free_slots(), 0);
+
+    const auto newer = fixture.fill_block(1, /*seed=*/60);
+    offload_cache->on_blocks_overwritten(/*hash=*/200, make_block_set(1));
+    offload_cache->flush();
+
+    EXPECT_EQ(offload_cache->get_num_entries(), 1);
+    EXPECT_FALSE(offload_cache->contains(100));
+    EXPECT_EQ(offload_cache->get_statistics().num_replaced, 1);
+
+    std::vector<uint8_t> restored;
+    ASSERT_TRUE(offload_cache->read(200, restored));
+    EXPECT_EQ(restored, newer);
+
+    std::vector<uint8_t> miss;
+    EXPECT_FALSE(offload_cache->read(/*hash=*/999, miss));
 }

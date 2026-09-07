@@ -122,8 +122,8 @@ public:
         auto& kv_manager = static_cast<KVCacheManager&>(*cache_mgr_it->second);
         auto backend = std::make_unique<KVCacheOffloadManager>(kv_manager.get_block_layout(), offload_config, device,
                                                                tenant_isolation_seed);
-        GENAI_INFO("[KV_TRACE] kv_cache_offload file=%s slot_bytes=%zu slots=%zu",
-                   backend->get_file_path().string().c_str(),
+        GENAI_INFO("[KV_TRACE] kv_cache_offload backend=%s slot_bytes=%zu slots=%zu",
+                   backend->describe().c_str(),
                    backend->get_slot_size(),
                    backend->get_num_slots());
 

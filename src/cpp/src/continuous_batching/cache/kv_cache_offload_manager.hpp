@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "continuous_batching/cache/i_kv_cache_storage_backend.hpp"
 #include "continuous_batching/cache/kv_cache_disk_layout.hpp"
 #include "openvino/genai/cache_offload.hpp"
 
@@ -23,8 +24,12 @@ namespace ov::genai {
  * Owns a run-specific file, hands out slots sized to exactly one block set, and performs
  * length-verified reads and writes. It deliberately knows nothing about block hashes,
  * sequences or eviction policy - those stay in the block manager and the orchestrator.
+ *
+ * This is openvino_genai's built-in `DefaultFileStorageBackend` (see `kv_cache_offload_new_plan.md`
+ * Phase 6): the only `IKVCacheStorageBackend` implementation today, and the one
+ * `KVCacheOffloadCache` falls back to when no third-party storage plugin is configured.
  */
-class KVCacheOffloadManager {
+class KVCacheOffloadManager : public IKVCacheStorageBackend {
 public:
     /**
      * @param tenant_isolation_seed Recorded in the persisted manifest header (has no effect when
@@ -36,7 +41,7 @@ public:
                           const CacheOffloadConfig& config,
                           const std::string& device,
                           uint64_t tenant_isolation_seed = 0);
-    ~KVCacheOffloadManager();
+    ~KVCacheOffloadManager() override;
 
     KVCacheOffloadManager(const KVCacheOffloadManager&) = delete;
     KVCacheOffloadManager& operator=(const KVCacheOffloadManager&) = delete;
@@ -45,21 +50,21 @@ public:
     static bool is_supported_device(const std::string& device);
 
     /// @return Size of one slot in bytes, equal to the byte size of one block set across all layers.
-    std::size_t get_slot_size() const {
+    std::size_t get_slot_size() const override {
         return m_slot_size;
     }
 
     /// @return Total number of slots derived from the configured capacity.
-    std::size_t get_num_slots() const {
+    std::size_t get_num_slots() const override {
         return m_num_slots;
     }
 
-    std::size_t get_num_free_slots() const;
+    std::size_t get_num_free_slots() const override;
 
     /// @return A free slot, or std::nullopt when the offload file is full.
-    std::optional<std::size_t> acquire_slot();
+    std::optional<std::size_t> acquire_slot() override;
 
-    void release_slot(std::size_t slot_id);
+    void release_slot(std::size_t slot_id) override;
 
     /**
      * @brief Writes one slot's data, computing and recording its integrity checksum.
@@ -68,7 +73,9 @@ public:
      * never uses it for any eviction or lookup decision. Omit it to leave the slot absent from the
      * persisted index (it will simply not be recoverable after a restart).
      */
-    void write_slot(std::size_t slot_id, const std::vector<uint8_t>& block_data, std::optional<std::size_t> hash = std::nullopt);
+    void write_slot(std::size_t slot_id,
+                   const std::vector<uint8_t>& block_data,
+                   std::optional<std::size_t> hash = std::nullopt) override;
 
     /**
      * @brief Reads one slot's data and verifies it against the checksum recorded by write_slot() (or, for
@@ -76,7 +83,7 @@ public:
      * @throws ov::Exception if the checksum does not match, so a caller already treating I/O errors as a
      * miss (recomputing instead of trusting corrupted bytes) gets the same safe behavior here.
      */
-    void read_slot(std::size_t slot_id, std::vector<uint8_t>& block_data) const;
+    void read_slot(std::size_t slot_id, std::vector<uint8_t>& block_data) const override;
 
     const std::filesystem::path& get_file_path() const {
         return m_file_path;
@@ -85,8 +92,13 @@ public:
     /// @return (hash, slot_id) pairs recovered from a compatible persisted cache at construction time.
     /// Empty when persistence is disabled, this is the first run for this directory, or the persisted
     /// cache was incompatible (see CacheOffloadConfig::enable_persistence) and was therefore rebuilt fresh.
-    const std::vector<std::pair<std::size_t, std::size_t>>& get_recovered_entries() const {
+    const std::vector<std::pair<std::size_t, std::size_t>>& get_recovered_entries() const override {
         return m_recovered_entries;
+    }
+
+    /// @return The offload file's path, for logging/diagnostics only.
+    std::string describe() const override {
+        return m_file_path.string();
     }
 
     /// Deletes a persisted cache's files from @p directory, if present. Safe to call on a directory with

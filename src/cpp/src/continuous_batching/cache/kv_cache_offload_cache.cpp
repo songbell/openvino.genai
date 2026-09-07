@@ -32,7 +32,7 @@ private:
 }  // namespace
 
 KVCacheOffloadCache::KVCacheOffloadCache(KVCacheManager& cache_manager,
-                                         std::unique_ptr<KVCacheOffloadManager> backend,
+                                         std::unique_ptr<IKVCacheStorageBackend> backend,
                                                                                  std::size_t max_queued_stores,
                                                                                  bool wait_for_buffer,
                                                                                  bool enable_detailed_logging,

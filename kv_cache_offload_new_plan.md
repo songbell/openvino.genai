@@ -612,7 +612,7 @@ tenant/salt 产生不同种子、拼接歧义不塌陷）；3 个 `TestBlockMana
 
 安全隔离应先于插件公开，因为插件不能绕过 core 的 hash、tenant 和失效策略。
 
-### Phase 6：第三方存储后端接口
+### Phase 6：第三方存储后端接口（施工顺序 1-2 已完成，3-4 未开始）
 
 目标：在内部文件 backend 语义稳定后，开放不依赖 OpenVINO C++ ABI 的 vendor storage plugin。
 
@@ -633,26 +633,46 @@ Storage backend plugin
 
 插件不直接接触 `Sequence`、`BlockManager`、`CacheBlock`、`RemoteTensor` 或 ModelRunner。插件也不决定 LRU、prefix 命中和 slot 淘汰。
 
-#### 6.2 内部 C++ contract
+#### 6.2 内部 C++ contract（已实现）
 
-先在 `KVCacheOffloadCache` 和文件 backend 之间定义内部接口，建议包含：
+实际落地的接口（`src/cpp/src/continuous_batching/cache/i_kv_cache_storage_backend.hpp`）比本节最初的建议
+略宽，因为要覆盖已经完成的 Phase 1-5 能力（容量/统计查询、`hash` 参数化的持久化 publish、跨重启恢复），
+不是简单的 `contains/acquire/release/write/read/flush`：
 
 ```cpp
 class IKVCacheStorageBackend {
 public:
   virtual ~IKVCacheStorageBackend() = default;
-  virtual bool contains(std::size_t slot_id) const = 0;
+  virtual std::size_t get_slot_size() const = 0;
+  virtual std::size_t get_num_slots() const = 0;
+  virtual std::size_t get_num_free_slots() const = 0;
   virtual std::optional<std::size_t> acquire_slot() = 0;
   virtual void release_slot(std::size_t slot_id) = 0;
-  virtual void write_slot(std::size_t slot_id,
-              const std::vector<std::uint8_t>& data) = 0;
-  virtual void read_slot(std::size_t slot_id,
-               std::vector<std::uint8_t>& data) const = 0;
-  virtual void flush() = 0;
+  virtual void write_slot(std::size_t slot_id, const std::vector<std::uint8_t>& data,
+                          std::optional<std::size_t> hash = std::nullopt) = 0;
+  virtual void read_slot(std::size_t slot_id, std::vector<std::uint8_t>& data) const = 0;
+  virtual const std::vector<std::pair<std::size_t, std::size_t>>& get_recovered_entries() const = 0;
+  virtual std::string describe() const = 0;
 };
 ```
 
-第一步只把现有 `KVCacheOffloadManager` 改造成 `DefaultFileStorageBackend`，不改变 slot layout、临时文件语义或同步结果。
+`KVCacheOffloadCache` 现在只持有 `std::unique_ptr<IKVCacheStorageBackend>`（不再直接引用具体类型），
+`CacheOrchestrator` 是唯一负责构造具体 backend 实例并把它交给 `KVCacheOffloadCache` 的地方。
+
+第一步只把现有 `KVCacheOffloadManager` 改造成 `DefaultFileStorageBackend`，不改变 slot layout、临时文件语义或同步结果——
+**这一步已完成，但采用的是"让 `KVCacheOffloadManager` 实现该接口"而不是"把类改名为 `DefaultFileStorageBackend`"**：
+后者需要一次触及约 90 处调用点（源码 + 现有 30+ 个既存测试）的大规模重命名，收益是纯粹的命名一致性，
+没有任何行为或架构上的额外好处；出于风险控制的考虑选择了保留 `KVCacheOffloadManager` 这个名字，
+只在类文档注释里明确写出它现在扮演的角色（"这是 openvino_genai 内置的 `DefaultFileStorageBackend`"）。
+如果后续确实需要这个名字（例如要公开在某个 C++ API 文档里），可以用 IDE 的语义重命名一次性完成，
+风险应该是可控的。
+
+验证：新增 2 个测试（`TestKVCacheOffloadCache.WorksWithThirdPartyStorageBackend`、
+`EvictionAndMissPolicyAreBackendAgnostic`），用一个纯内存、不依赖文件系统的 `InMemoryMockStorageBackend`
+证明 hash 索引、LRU 淘汰、miss 上报等全部是 `KVCacheOffloadCache` 自己的逻辑，与具体 backend 实现完全无关——
+这正是 6.5 节要求的 "mock backend 测试"。全部通过；既有 100 项 offload/block-manager/cache-manager 相关
+测试及完整 716 项测试套件（17 项已知无关失败，与之前各阶段相同）均无回归；真实 GPU E2E 复测通过；
+Python 绑定重新编译通过（未改动任何 Python 可见 API）。
 
 #### 6.3 稳定 C ABI
 
@@ -733,10 +753,14 @@ direct storage / GPUDirect
 
 施工顺序：
 
-1. 内置 default backend adapter，行为与现有文件 backend 一致。
-2. capability、metadata、错误码和 mock backend 测试。
-3. 动态 `LoadLibrary` / `dlopen` 加载 C ABI，并提供官方 sample plugin。
-4. 再接入 io_uring、SPDK、ZNS/FDP 或 GPUDirect 等厂商优化。
+1. 内置 default backend adapter，行为与现有文件 backend 一致。**已完成**（见 6.2：`IKVCacheStorageBackend` +
+   `KVCacheOffloadManager` 实现该接口 + `KVCacheOffloadCache` 只依赖接口类型）。
+2. capability、metadata、错误码和 mock backend 测试。**部分完成**：mock backend 测试已完成（见 6.2）；
+   capability 声明（`sync/batch/async I/O`、`pinned/USM`）和统一错误码枚举**尚未实现**——当前只有一个
+   具体 backend（内置文件实现），没有第二个真实 backend 需要区分能力或错误语义，先添加这些会是没有
+   实际调用方的纯声明性代码，因此推迟到真的要接入第一个外部/mock-beyond-test backend 时再做。
+3. 动态 `LoadLibrary` / `dlopen` 加载 C ABI，并提供官方 sample plugin。**未开始**。
+4. 再接入 io_uring、SPDK、ZNS/FDP 或 GPUDirect 等厂商优化。**未开始**。
 
 插件显式配置但加载失败时默认报错，不应静默切回普通 backend 造成性能结果失真；自动发现的可选优化才允许显式配置 fallback。
 

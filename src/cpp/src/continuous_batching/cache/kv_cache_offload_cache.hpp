@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "continuous_batching/cache/block_manager.hpp"
+#include "continuous_batching/cache/i_kv_cache_storage_backend.hpp"
 #include "continuous_batching/cache/kv_cache_host_block_pool.hpp"
 #include "continuous_batching/cache/kv_cache_manager.hpp"
 #include "continuous_batching/cache/kv_cache_offload_manager.hpp"
@@ -94,7 +95,7 @@ public:
     };
 
     KVCacheOffloadCache(KVCacheManager& cache_manager,
-                        std::unique_ptr<KVCacheOffloadManager> backend,
+                        std::unique_ptr<IKVCacheStorageBackend> backend,
                         std::size_t max_queued_stores = 2,
                         bool wait_for_buffer = false,
                         bool enable_detailed_logging = false,
@@ -167,7 +168,7 @@ private:
     void run_writer();
 
     KVCacheManager& m_cache_manager;
-    std::unique_ptr<KVCacheOffloadManager> m_backend;
+    std::unique_ptr<IKVCacheStorageBackend> m_backend;
     std::unordered_map<std::size_t, Entry> m_entries;
     // Front is the oldest entry and the first to be replaced when the file is full.
     std::list<std::size_t> m_insertion_order;
