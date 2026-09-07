@@ -503,8 +503,6 @@ void init_continuous_batching_pipeline(py::module_& m) {
         .def_readwrite("sparse_attention_config", &SchedulerConfig::sparse_attention_config)
         .def_readwrite("use_cache_offload", &SchedulerConfig::use_cache_offload)
         .def_readwrite("cache_offload_config", &SchedulerConfig::cache_offload_config)
-        .def_readwrite("tenant_id", &SchedulerConfig::tenant_id)
-        .def_readwrite("cache_salt", &SchedulerConfig::cache_salt)
         .def("to_string", &SchedulerConfig::to_string);
 
     py::class_<PipelineMetrics>(m, "PipelineMetrics", pipeline_metrics_docstring)

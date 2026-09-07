@@ -14,7 +14,6 @@
 #include <utility>
 #include <vector>
 
-#include "continuous_batching/cache/kv_cache_isolation_seed.hpp"
 #include "logger.hpp"
 #include "sequence_group.hpp"
 
@@ -708,9 +707,6 @@ class BlockManager {
     size_t m_num_layers;
     size_t m_fixed_blocks_per_sequence = 0;  /// When > 0, each sequence gets exactly this many blocks.
     bool m_restore_latest_prefix_block_only = false;
-    // 0 means no tenant/cache_salt was configured (see compute_prefix_isolation_seed()); every block hash
-    // is used exactly as computed by Sequence::get_hash() in that case, matching pre-isolation behavior.
-    uint64_t m_hash_root_seed = 0;
     // TODO: caching time can probably be improved if we use the prefix tree
     std::map<uint64_t, BlocksPerLayer> m_prefix_hash_to_cached_blocks;
     std::map<size_t, size_t> m_cached_content_length_ref_counts;
@@ -748,16 +744,12 @@ public:
      *        When 0 (default), blocks grow with context length.
      * @param restore_latest_prefix_block_only When true, prefix-cache restore keeps only the latest matching
      *        block and tracks its logical block-table offset. Used for linear-attention state cache.
-     * @param hash_root_seed Mixed into every block hash computed by this manager (see
-     *        compute_prefix_isolation_seed()), so a different tenant/cache_salt never collides with this
-     *        one even for identical prefix content. 0 (the default) disables mixing entirely.
      */
     BlockManager(int num_blocks, bool enable_prefix_caching, size_t block_size, size_t num_layers = 1,
-                 size_t fixed_blocks_per_sequence = 0, bool restore_latest_prefix_block_only = false,
-                 uint64_t hash_root_seed = 0)
+                 size_t fixed_blocks_per_sequence = 0, bool restore_latest_prefix_block_only = false)
         : m_allocator(num_blocks, enable_prefix_caching, num_layers), m_enable_prefix_caching(enable_prefix_caching), m_block_size(block_size),
         m_num_layers(num_layers), m_fixed_blocks_per_sequence(fixed_blocks_per_sequence),
-        m_restore_latest_prefix_block_only(restore_latest_prefix_block_only), m_hash_root_seed(hash_root_seed) {
+        m_restore_latest_prefix_block_only(restore_latest_prefix_block_only) {
         OPENVINO_ASSERT(num_layers != 0, "num_layers must be non-zero");
         OPENVINO_ASSERT(!restore_latest_prefix_block_only || enable_prefix_caching,
                         "Latest prefix block restore requires prefix caching to be enabled");
@@ -772,23 +764,6 @@ public:
                       leaked_tables,
                       static_cast<unsigned long long>(first_leaked_seq_id));
         }
-    }
-
-    /**
-     * @brief Computes the (possibly tenant-isolated) prefix-cache hash for @p sequence at @p content_length.
-     *
-     * This is the single point where every block hash used for prefix-cache lookup, storage and disk
-     * offload publish/restore passes through m_hash_root_seed, so tenant isolation applies uniformly
-     * regardless of call site.
-     */
-    size_t seeded_hash(const Sequence::Ptr& sequence, size_t content_length) const {
-        const size_t content_hash = sequence->get_hash(content_length, m_block_size);
-        if (m_hash_root_seed == 0) {
-            return content_hash;
-        }
-        // boost::hash_combine-style mixing: cheap, well-distributed, and never collapses to the
-        // un-seeded value for a non-zero seed.
-        return content_hash ^ (m_hash_root_seed + 0x9e3779b97f4a7c15ULL + (content_hash << 6) + (content_hash >> 2));
     }
 
     /**
@@ -1575,7 +1550,7 @@ public:
                     new_blocks_for_all_layers.reserve(effective_num_layers);
                     if (m_enable_prefix_caching) {
                         const size_t content_length = seq_group->get_context_len();
-                        const auto hash = seeded_hash(sequence, content_length);
+                        const auto hash = sequence->get_hash(content_length, m_block_size);
                         new_blocks_for_all_layers = allocate_cached_block(hash, content_length);
                     } else {
                         for (size_t i = 0; i < effective_num_layers; i++) {
@@ -1597,7 +1572,7 @@ public:
                         // update hash of block
                         const auto prev_hash = last_blocks[0]->get_hash();
                         const size_t content_length = seq_group->get_context_len();
-                        const auto hash = seeded_hash(sequence, content_length);
+                        const auto hash = sequence->get_hash(content_length, m_block_size);
                         for (size_t i = 0; i < effective_num_layers; i++) {
                             auto& last_block = last_blocks[i];
                             last_block->set_hash(hash);
@@ -1684,7 +1659,7 @@ public:
         std::vector<PendingLoad> pending;
 
         for (size_t content_len = m_block_size; content_len <= prompt_len; content_len += m_block_size) {
-            const auto hash = seeded_hash(sequence, content_len);
+            const auto hash = sequence->get_hash(content_len, m_block_size);
             if (m_allocator.has_cached_block(hash, m_prefix_hash_to_cached_blocks)) {
                 chain.push_back(m_allocator.get_cached_block(hash, m_prefix_hash_to_cached_blocks));
                 continue;
@@ -1785,7 +1760,7 @@ private:
         const auto seq_id = sequence->get_id();
 
         for (size_t content_len : plan.block_content_lengths) {
-            if (!m_allocator.has_cached_block(seeded_hash(sequence, content_len),
+            if (!m_allocator.has_cached_block(sequence->get_hash(content_len, m_block_size),
                                               m_prefix_hash_to_cached_blocks)) {
                 return false;
             }
@@ -1797,7 +1772,7 @@ private:
         auto& block_table = m_block_table[seq_id];
 
         for (size_t content_len : plan.block_content_lengths) {
-            auto blocks = m_allocator.get_cached_block(seeded_hash(sequence, content_len),
+            auto blocks = m_allocator.get_cached_block(sequence->get_hash(content_len, m_block_size),
                                                        m_prefix_hash_to_cached_blocks);
             OPENVINO_ASSERT(!blocks.empty(), "Prefix restore plan became unavailable for token position ", content_len);
             const auto timestamp = std::chrono::steady_clock::now();
@@ -1828,7 +1803,7 @@ private:
             if (content_len > capped_token_position) {
                 content_len = capped_token_position;
             }
-            const auto full_block_hash = seeded_hash(sequence, content_len);
+            const auto full_block_hash = sequence->get_hash(content_len, m_block_size);
             if (m_allocator.has_cached_block(full_block_hash, m_prefix_hash_to_cached_blocks)) {
                 plan.block_content_lengths.push_back(content_len);
                 plan.cache_token_position = content_len;
@@ -1839,7 +1814,7 @@ private:
                         break;
                     }
                     const size_t partial_content_len = prev_iteration_content_len + i;
-                    const auto hash = seeded_hash(sequence, partial_content_len);
+                    const auto hash = sequence->get_hash(partial_content_len, m_block_size);
                     if (m_allocator.has_cached_block(hash, m_prefix_hash_to_cached_blocks)) {
                         plan.block_content_lengths.push_back(partial_content_len);
                         plan.cache_token_position = partial_content_len;
@@ -1898,7 +1873,7 @@ private:
             if (candidate_len <= interval_start) {
                 break;
             }
-            if (!m_allocator.has_cached_block(seeded_hash(sequence, candidate_len),
+            if (!m_allocator.has_cached_block(sequence->get_hash(candidate_len, m_block_size),
                                               m_prefix_hash_to_cached_blocks)) {
                 continue;
             }
@@ -2034,7 +2009,7 @@ private:
         } else {
             if (block_table.size() > 0) {
                 CacheBlock::Ptr last_block = block_table.back();
-                auto hash = seeded_hash(sequence, (logical_start + block_table.size()) * m_block_size);
+                auto hash = sequence->get_hash((logical_start + block_table.size()) * m_block_size, m_block_size);
                 auto prev_hash = last_block->get_hash();
                 if (prev_hash != hash) {
                     const size_t content_length = (logical_start + block_table.size()) * m_block_size;
@@ -2056,7 +2031,7 @@ private:
                 if (num_hashed_tokens > content_length) {
                     num_hashed_tokens = content_length;
                 }
-                auto hash = seeded_hash(sequence, num_hashed_tokens);
+                auto hash = sequence->get_hash(num_hashed_tokens, m_block_size);
                 auto blocks_for_all_layers = allocate_cached_block(hash, num_hashed_tokens);
                 for (size_t layer_idx = 0; layer_idx < blocks_for_all_layers.size(); layer_idx++) {
                     m_block_table[sequence_id][layer_idx].push_back(blocks_for_all_layers[layer_idx]);

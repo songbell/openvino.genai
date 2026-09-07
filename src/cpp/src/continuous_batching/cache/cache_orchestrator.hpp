@@ -20,7 +20,6 @@
 #include "continuous_batching/cache/cache_type.hpp"
 #include "continuous_batching/cache/i_cache_manager.hpp"
 #include "continuous_batching/cache/block_manager.hpp"
-#include "continuous_batching/cache/kv_cache_isolation_seed.hpp"
 #include "continuous_batching/cache/kv_cache_manager.hpp"
 #include "continuous_batching/cache/kv_cache_offload_cache.hpp"
 #include "continuous_batching/cache/linear_attention_cache_manager.hpp"
@@ -103,8 +102,10 @@ public:
         OPENVINO_ASSERT(orchestrator->has_registered_types(), "No supported cache types detected in the model");
 
         if (config.use_cache_offload) {
-            orchestrator->enable_kv_cache_offload(config.cache_offload_config, allocation_device,
-                                                  compute_prefix_isolation_seed(config.tenant_id, config.cache_salt));
+            // tenant_isolation_seed intentionally left at its default (0): tenant identity now lives on
+            // GenerationConfig (per-request), but the offload manifest is pipeline-scoped; a proper
+            // per-tenant persisted-cache story needs the Phase 3 storage-interface rework.
+            orchestrator->enable_kv_cache_offload(config.cache_offload_config, allocation_device);
         }
 
         return orchestrator;
@@ -945,15 +946,11 @@ private:
                            const SchedulerConfig& config) {
         const bool per_layer_control = config.use_cache_eviction;
         const size_t num_block_table_layers = per_layer_control ? kv_manager->get_num_layers() : 1;
-        const uint64_t hash_root_seed = compute_prefix_isolation_seed(config.tenant_id, config.cache_salt);
         auto block_manager = std::make_unique<BlockManager>(
             config.num_kv_blocks,
             config.enable_prefix_caching,
             kv_manager->get_block_size(),
-            num_block_table_layers,
-            /*fixed_blocks_per_sequence=*/0,
-            /*restore_latest_prefix_block_only=*/false,
-            hash_root_seed);
+            num_block_table_layers);
 
         register_cache_type(CacheType::KV_CACHE, std::move(kv_manager), std::move(block_manager),
                             per_layer_control);
@@ -965,7 +962,6 @@ private:
     void register_linear_attention_cache(std::unique_ptr<LinearAttentionCacheManager> la_manager,
                                          const SchedulerConfig& config,
                                          size_t cache_interval) {
-        const uint64_t hash_root_seed = compute_prefix_isolation_seed(config.tenant_id, config.cache_salt);
         std::unique_ptr<BlockManager> la_block_manager;
         if (config.enable_prefix_caching) {
             OPENVINO_ASSERT(cache_interval > 0,
@@ -976,8 +972,7 @@ private:
                 cache_interval,
                 1,
                 0,
-                true,
-                hash_root_seed);
+                true);
         } else {
             la_block_manager = std::make_unique<BlockManager>(
                 config.num_linear_attention_blocks,
