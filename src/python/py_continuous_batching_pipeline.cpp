@@ -130,13 +130,15 @@ auto cache_offload_config_docstring = R"(
     :param use_page_cache: whether the offload file may go through the OS page cache. Direct I/O is not implemented yet.
     :type use_page_cache: bool
 
-    :param storage_backend_type: selects the storage backend implementation; "default" is the only supported value today.
+    :param storage_backend_type: selects the storage backend implementation: "default" (built-in file-based
+      backend) or "plugin" (load a third-party vendor shared library from storage_plugin_path).
     :type storage_backend_type: str
 
-    :param storage_plugin_path: path to a third-party storage plugin shared library. Not yet implemented.
+    :param storage_plugin_path: path to a third-party storage plugin shared library exporting the
+      ov_genai_get_ssd_plugin C ABI symbol. Required when storage_backend_type is "plugin".
     :type storage_plugin_path: str
 
-    :param storage_plugin_properties: vendor-specific properties passed through to a loaded storage plugin. Not yet implemented.
+    :param storage_plugin_properties: vendor-specific properties passed through to a loaded storage plugin.
     :type storage_plugin_properties: dict
 )";
 auto scheduler_config_docstring = R"(

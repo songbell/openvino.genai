@@ -22,6 +22,7 @@
 #include "continuous_batching/cache/block_manager.hpp"
 #include "continuous_batching/cache/kv_cache_manager.hpp"
 #include "continuous_batching/cache/kv_cache_offload_cache.hpp"
+#include "continuous_batching/cache/kv_cache_offload_ssd_plugin_backend.hpp"
 #include "continuous_batching/cache/linear_attention_cache_manager.hpp"
 #include "logger.hpp"
 
@@ -123,8 +124,22 @@ public:
                         "KV cache offload is not supported on device ", device);
 
         auto& kv_manager = static_cast<KVCacheManager&>(*cache_mgr_it->second);
-        auto backend = std::make_unique<KVCacheOffloadManager>(kv_manager.get_block_layout(), offload_config,
-                                                               tenant_isolation_seed);
+        std::unique_ptr<IKVCacheStorageBackend> backend;
+        if (offload_config.storage_backend_type == "default") {
+            OPENVINO_ASSERT(offload_config.storage_plugin_path.empty(),
+                            "KV cache offload storage_plugin_path is set but storage_backend_type is "
+                            "'default'; set storage_backend_type to 'plugin' to use it");
+            backend = std::make_unique<KVCacheOffloadManager>(kv_manager.get_block_layout(), offload_config,
+                                                              tenant_isolation_seed);
+        } else if (offload_config.storage_backend_type == "plugin") {
+            OPENVINO_ASSERT(!offload_config.storage_plugin_path.empty(),
+                            "KV cache offload storage_backend_type is 'plugin' but storage_plugin_path is empty");
+            backend = std::make_unique<KVCacheOffloadSSDPluginBackend>(kv_manager.get_block_layout(), offload_config);
+        } else {
+            OPENVINO_THROW("Unknown KV cache offload storage_backend_type '",
+                          offload_config.storage_backend_type,
+                          "'; supported values are 'default' and 'plugin'");
+        }
         GENAI_INFO("[KV_TRACE] kv_cache_offload backend=%s slots=%zu",
                    backend->describe().c_str(),
                    backend->get_num_slots());

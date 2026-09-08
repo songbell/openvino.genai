@@ -84,23 +84,25 @@ struct CacheOffloadConfig {
     std::string tokenizer_fingerprint;
 
     /**
-     * Selects the storage backend implementation: `"default"` (the built-in file-based backend) is the
-     * only supported value today. A non-"default" value throws at pipeline construction time - see
-     * `new_plan.md` Phase 4, not yet implemented - rather than silently falling back to "default".
+     * Selects the storage backend implementation: `"default"` (the built-in file-based backend, the
+     * default) or `"plugin"` (load a third-party vendor shared library from `storage_plugin_path`, see
+     * `new_plan.md` Phase 4). Any other value throws at pipeline construction time.
      */
     std::string storage_backend_type = "default";
 
     /**
      * Path to a third-party storage plugin shared library to load in place of the default backend.
-     * Not yet implemented (`new_plan.md` Phase 4): a non-empty value throws at pipeline construction
-     * time rather than being silently ignored.
+     * Required (and must name a loadable library exporting the `ov_genai_get_ssd_plugin` C ABI symbol,
+     * see `openvino/genai/c/ssd_plugin_interface.h`) when `storage_backend_type` is `"plugin"`; must be
+     * empty when `storage_backend_type` is `"default"`. A plugin that fails to load or initialize
+     * throws rather than silently falling back to the default backend.
      */
     std::string storage_plugin_path;
 
     /**
-     * Vendor-specific properties passed through to a loaded storage plugin. Not yet implemented
-     * (`new_plan.md` Phase 4): a non-empty map throws at pipeline construction time rather than being
-     * silently ignored.
+     * Vendor-specific properties passed through to a loaded storage plugin (only meaningful when
+     * `storage_backend_type` is `"plugin"`), serialized as `key1=value1;key2=value2;...` across the C
+     * ABI - every value must be convertible to `std::string`.
      */
     ov::AnyMap storage_plugin_properties;
 

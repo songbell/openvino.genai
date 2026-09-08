@@ -218,12 +218,17 @@ KVCacheOffloadManager::KVCacheOffloadManager(const KVCacheDiskLayout& layout,
     }
     OPENVINO_ASSERT(config.use_page_cache,
                     "KV cache disk offload with direct I/O is not implemented yet, set use_page_cache to true");
+    // Choosing between this backend and a plugin backend is the caller's job (see
+    // CacheOrchestrator::enable_kv_cache_offload); these are a defensive check against constructing this
+    // backend directly with a config that says otherwise, not the actual dispatch point.
     OPENVINO_ASSERT(config.storage_backend_type == "default",
-                    "KV cache offload storage_backend_type '",
+                    "KVCacheOffloadManager (the default file-based backend) must only be constructed for "
+                    "storage_backend_type 'default', got '",
                     config.storage_backend_type,
-                    "' is not supported yet (see new_plan.md Phase 4); only 'default' is implemented");
+                    "'");
     OPENVINO_ASSERT(config.storage_plugin_path.empty(),
-                    "KV cache offload storage_plugin_path is not supported yet (see new_plan.md Phase 4)");
+                    "KVCacheOffloadManager (the default file-based backend) must not be constructed when "
+                    "storage_plugin_path is set; use storage_backend_type 'plugin' instead");
 
     std::filesystem::path directory;
     if (config.storage_cache_dir.empty()) {
