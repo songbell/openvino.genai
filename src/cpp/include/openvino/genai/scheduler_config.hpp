@@ -32,6 +32,17 @@ struct SchedulerConfig {
     // When both num_kv_blocks and cache_size are equal to zero dynamic cache allocation is turned on.
     std::size_t cache_size = 0;
 
+    /**
+     * See new_plan.md Phase 5: whether the GPU KV cache is allocated as multiple fixed-size device
+     * memory chunks (instead of one tensor that is reallocated/copied every time it grows), enabling
+     * the paged_attention op's chunked addressing path. No effect on non-GPU devices.
+     */
+    bool use_chunked_kv_cache = false;
+    /**
+     * Number of physical KV cache blocks per chunk when `use_chunked_kv_cache` is enabled.
+     */
+    std::size_t kv_cache_chunk_size_blocks = 512;
+
     // total number of linear attention blocks available to scheduler logic.
     // Each block holds the full state for one sequence across all linear attention ops.
     // When 0, automatically derived from max_num_seqs if linear attention layers are detected.
@@ -123,6 +134,15 @@ struct SchedulerConfig {
                 "SchedulerConfig enable_kv_cache_offloading is not supported together with use_cache_eviction");
         OPENVINO_ASSERT(!enable_kv_cache_offloading || cache_offload_config.capacity_bytes > 0,
                 "SchedulerConfig cache_offload_config.capacity_bytes must be greater than 0 when enable_kv_cache_offloading is enabled");
+        // Chunked KV cache (see new_plan.md Phase 5) only covers the plain-generation allocation path so
+        // far: cache eviction (and its rotation), disk offloading, and prefix caching all address cache
+        // blocks by absolute physical index in ways that have not yet been made chunk-aware.
+        OPENVINO_ASSERT(!use_chunked_kv_cache || !use_cache_eviction,
+                "SchedulerConfig use_chunked_kv_cache is not yet supported together with use_cache_eviction");
+        OPENVINO_ASSERT(!use_chunked_kv_cache || !enable_prefix_caching,
+                "SchedulerConfig use_chunked_kv_cache is not yet supported together with enable_prefix_caching");
+        OPENVINO_ASSERT(!use_chunked_kv_cache || !enable_kv_cache_offloading,
+                "SchedulerConfig use_chunked_kv_cache is not yet supported together with enable_kv_cache_offloading");
     }
 
     bool operator==(const SchedulerConfig& other) const {

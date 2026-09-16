@@ -821,7 +821,7 @@ private:
 
         std::unique_ptr<KVCacheManager> kv_manager;
         if (KVCacheManager::has_cache_inputs(compiled_model)) {
-            kv_manager = std::make_unique<KVCacheManager>(infer_request);
+            kv_manager = std::make_unique<KVCacheManager>(infer_request, config.use_chunked_kv_cache, config.kv_cache_chunk_size_blocks);
         }
 
         std::unique_ptr<LinearAttentionCacheManager> la_manager;

@@ -80,12 +80,13 @@ void Logger::write_message(ov::log::Level level, const char* file, int line, con
     format_prefix(out, level, file, line);
     out << msg;
     if (msg.empty() || msg.back() != '\n') {
-        if (level == ov::log::Level::ERR) {
-            out << std::endl;
-        } else {
-            out << '\n';
-        }
+        out << '\n';
     }
+    // Flush unconditionally: on an abrupt crash (e.g. an unhandled exception on another thread,
+    // or a driver-level fault), a fully-buffered stream (the common case once stdout/stderr is
+    // redirected to a file/pipe rather than a console) would otherwise lose whatever was written
+    // but not yet flushed, making these traces useless for exactly the crashes they're meant to debug.
+    out.flush();
 }
 
 void Logger::log_format_impl(ov::log::Level level, const char* file, int line, const char* format, va_list args) {

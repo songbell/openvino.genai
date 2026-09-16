@@ -9,6 +9,7 @@
 #include <cstring>
 
 #include "openvino/runtime/tensor.hpp"
+#include "openvino/runtime/intel_gpu/remote_properties.hpp"
 #include "continuous_batching/cache/i_cache_manager.hpp"
 #include "continuous_batching/cache/kv_cache_disk_layout.hpp"
 #include "logger.hpp"
@@ -26,6 +27,17 @@ class KVCacheManager : public ICacheManager {
     ov::InferRequest m_request;
     ov::RemoteContext m_context;
 
+    // See new_plan.md Phase 5: when enabled, key/value cache storage is grown in fixed-size chunks
+    // (each chunk a separate device allocation) instead of one growing tensor per layer, and the
+    // corresponding `paged_attention` primitive reads/writes through the `chunk_base_ptrs.N` model
+    // input instead of `key_cache.N`/`value_cache.N`. Mutually exclusive with cache eviction/rotation,
+    // disk offloading, and prefix caching (see SchedulerConfig::validate()) since those address cache
+    // blocks via the single-tensor accessors below, which have not been made chunk-aware.
+    bool m_chunked_kv_cache = false;
+    size_t m_blocks_per_chunk = 0;
+    std::vector<std::vector<ov::Tensor>> m_key_chunks, m_value_chunks;  // [layer][chunk_id]
+    std::vector<ov::Tensor> m_chunk_base_ptrs;                         // [layer], i64 [2 * num_chunks]
+
     static ov::Shape set_kv_blocks(ov::PartialShape pshape, size_t num_kv_blocks) {
         pshape[0] = num_kv_blocks;
         return pshape.get_shape();
@@ -34,6 +46,86 @@ class KVCacheManager : public ICacheManager {
     void update_request_tensor(size_t decoder_layer_id) {
         m_request.set_tensor(std::string("key_cache.") + std::to_string(decoder_layer_id), m_key_cache[decoder_layer_id]);
         m_request.set_tensor(std::string("value_cache.") + std::to_string(decoder_layer_id), m_value_cache[decoder_layer_id]);
+    }
+
+    // --- chunked KV cache helpers (see new_plan.md Phase 5) ---
+
+    size_t chunk_id_of(size_t physical_block_id) const {
+        return physical_block_id / m_blocks_per_chunk;
+    }
+
+    size_t local_block_id_of(size_t physical_block_id) const {
+        return physical_block_id % m_blocks_per_chunk;
+    }
+
+    static int64_t usm_pointer_of(const ov::Tensor& chunk_tensor) {
+        // Avoids depending on openvino/runtime/intel_gpu/ocl/ocl.hpp's USMTensor helper, which pulls in
+        // the OpenCL C++ headers (CL/cl2.hpp) that aren't on this project's include path; mem_handle is
+        // just a property name (see remote_properties.hpp), readable off any ov::RemoteTensor directly.
+        auto remote_tensor = const_cast<ov::Tensor&>(chunk_tensor).as<ov::RemoteTensor>();
+        auto params = remote_tensor.get_params();
+        void* ptr = params.at(ov::intel_gpu::mem_handle.name()).as<ov::intel_gpu::gpu_handle_param>();
+        OPENVINO_ASSERT(ptr != nullptr, "Chunked KV cache chunk did not provide a valid USM device pointer");
+        return reinterpret_cast<int64_t>(ptr);
+    }
+
+    // The `key_cache.N`/`value_cache.N` model inputs stay declared (the kernel still takes them as
+    // fixed arguments, see pa_kv_cache_update_ref.cl/paged_attention_opt.cl), but are dead in chunked
+    // mode: nothing reads or writes them. Bind the smallest legal (1-block) dummy allocation once.
+    void bind_dummy_legacy_cache_tensor(size_t decoder_layer_id) {
+        ov::Shape key_shape = set_kv_blocks(m_key_shapes[decoder_layer_id], 1);
+        ov::Shape value_shape = set_kv_blocks(m_value_shapes[decoder_layer_id], 1);
+        ov::Tensor key_dummy = m_context.create_tensor(get_key_cache_precision(decoder_layer_id), key_shape);
+        ov::Tensor value_dummy = m_context.create_tensor(get_value_cache_precision(decoder_layer_id), value_shape);
+        m_request.set_tensor(std::string("key_cache.") + std::to_string(decoder_layer_id), key_dummy);
+        m_request.set_tensor(std::string("value_cache.") + std::to_string(decoder_layer_id), value_dummy);
+    }
+
+    // Rebuilds the full `chunk_base_ptrs.N` table (key chunk pointers followed by value chunk
+    // pointers, see PagedAttentionExtension::has_chunk_base_ptrs) and rebinds it. Cheap: this only
+    // copies a handful of int64 pointers, never KV data.
+    void refresh_chunk_base_ptrs_tensor(size_t decoder_layer_id) {
+        const size_t num_chunks = m_key_chunks[decoder_layer_id].size();
+        ov::Tensor chunk_base_ptrs(ov::element::i64, ov::Shape{2 * num_chunks});
+        auto* data = chunk_base_ptrs.data<int64_t>();
+        for (size_t i = 0; i < num_chunks; ++i) {
+            data[i] = usm_pointer_of(m_key_chunks[decoder_layer_id][i]);
+            data[num_chunks + i] = usm_pointer_of(m_value_chunks[decoder_layer_id][i]);
+        }
+        m_chunk_base_ptrs[decoder_layer_id] = chunk_base_ptrs;
+        m_request.set_tensor(std::string("chunk_base_ptrs.") + std::to_string(decoder_layer_id), chunk_base_ptrs);
+    }
+
+    // Only ever appends brand-new chunks; existing chunks (and the KV data already written into them)
+    // are never reallocated, copied, or moved. This is the actual point of chunking: growth no longer
+    // costs an O(existing_cache_size) copy.
+    void allocate_chunked_cache_if_needed(size_t num_kv_blocks) {
+        const size_t num_chunks_needed = (num_kv_blocks + m_blocks_per_chunk - 1) / m_blocks_per_chunk;
+        GENAI_INFO("[KV_TRACE] allocate_chunked_physical_cache old_blocks=%zu new_blocks=%zu chunks=%zu blocks_per_chunk=%zu layers=%zu",
+                   m_num_allocated_kv_blocks,
+                   num_chunks_needed * m_blocks_per_chunk,
+                   num_chunks_needed,
+                   m_blocks_per_chunk,
+                   m_num_layers);
+        for (size_t decoder_layer_id = 0; decoder_layer_id < m_num_layers; ++decoder_layer_id) {
+            if (m_key_chunks[decoder_layer_id].empty()) {
+                bind_dummy_legacy_cache_tensor(decoder_layer_id);
+            }
+            ov::Shape key_chunk_shape = set_kv_blocks(m_key_shapes[decoder_layer_id], m_blocks_per_chunk);
+            ov::Shape value_chunk_shape = set_kv_blocks(m_value_shapes[decoder_layer_id], m_blocks_per_chunk);
+            // Chunk tensors must be true USM device allocations (not the plugin's default cl_mem
+            // buffer): usm_pointer_of() hands their address straight to a kernel as a raw pointer, and
+            // a cl_mem handle is not a dereferenceable device address.
+            const ov::AnyMap usm_device_params{{ov::intel_gpu::shared_mem_type.name(), ov::intel_gpu::SharedMemType::USM_DEVICE_BUFFER}};
+            while (m_key_chunks[decoder_layer_id].size() < num_chunks_needed) {
+                m_key_chunks[decoder_layer_id].push_back(
+                    m_context.create_tensor(get_key_cache_precision(decoder_layer_id), key_chunk_shape, usm_device_params));
+                m_value_chunks[decoder_layer_id].push_back(
+                    m_context.create_tensor(get_value_cache_precision(decoder_layer_id), value_chunk_shape, usm_device_params));
+            }
+            refresh_chunk_base_ptrs_tensor(decoder_layer_id);
+        }
+        m_num_allocated_kv_blocks = num_chunks_needed * m_blocks_per_chunk;
     }
 
 public:
@@ -57,7 +149,22 @@ public:
         return false;
     }
 
-    explicit KVCacheManager(ov::InferRequest request) :
+    /**
+     * @brief Check whether the compiled model was built with the chunked KV cache input
+     * (`chunk_base_ptrs.*`, see new_plan.md Phase 5 / ov::pass::SDPAToPagedAttention's
+     * allow_chunked_kv_cache option).
+     */
+    static bool has_chunk_base_ptrs_inputs(const ov::CompiledModel& compiled_model) {
+        for (const auto& input : compiled_model.inputs()) {
+            for (const auto& name : input.get_names()) {
+                if (name.find("chunk_base_ptrs.") == 0)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    explicit KVCacheManager(ov::InferRequest request, bool use_chunked_kv_cache = false, size_t blocks_per_chunk = 0) :
         m_request(request) {
         // extract information about inference device
         ov::CompiledModel compiled_model = request.get_compiled_model();
@@ -114,12 +221,29 @@ public:
         m_block_size = all_gpu_device ? ( has_xattention ? gpu_block_size_xattn : gpu_block_size ) : cpu_block_size;
         m_num_layers = m_value_precisions.size();
         OPENVINO_ASSERT(m_num_layers == m_key_precisions.size(), "Invalid case: a different number of K and V caches in a LLM model");
-        GENAI_INFO("[KV_TRACE] physical_manager device=%s layers=%zu block_size=%zu block_bytes=%zu remote=%s",
+
+        if (use_chunked_kv_cache) {
+            OPENVINO_ASSERT(m_context, "SchedulerConfig use_chunked_kv_cache requires a GPU device");
+            OPENVINO_ASSERT(blocks_per_chunk > 0, "SchedulerConfig kv_cache_chunk_size_blocks must be greater than 0 when use_chunked_kv_cache is enabled");
+            OPENVINO_ASSERT(has_chunk_base_ptrs_inputs(compiled_model),
+                            "SchedulerConfig use_chunked_kv_cache is enabled, but the compiled model has no "
+                            "chunk_base_ptrs.* input; ov::pass::SDPAToPagedAttention must be run with "
+                            "allow_chunked_kv_cache=true to produce a compatible model");
+            m_chunked_kv_cache = true;
+            m_blocks_per_chunk = blocks_per_chunk;
+            m_key_chunks.resize(m_num_layers);
+            m_value_chunks.resize(m_num_layers);
+            m_chunk_base_ptrs.resize(m_num_layers);
+        }
+
+        GENAI_INFO("[KV_TRACE] physical_manager device=%s layers=%zu block_size=%zu block_bytes=%zu remote=%s chunked=%s blocks_per_chunk=%zu",
                m_device.c_str(),
                m_num_layers,
                m_block_size,
                m_block_size_in_bytes,
-               m_context ? "true" : "false");
+               m_context ? "true" : "false",
+               m_chunked_kv_cache ? "true" : "false",
+               m_blocks_per_chunk);
     }
 
     // --- ICacheManager interface ---
@@ -168,6 +292,10 @@ public:
 
     void allocate_cache_if_needed(size_t num_kv_blocks) override {
         if (m_num_allocated_kv_blocks >= num_kv_blocks) {
+            return;
+        }
+        if (m_chunked_kv_cache) {
+            allocate_chunked_cache_if_needed(num_kv_blocks);
             return;
         }
         GENAI_INFO("[KV_TRACE] allocate_physical_cache old_blocks=%zu new_blocks=%zu layers=%zu",
@@ -312,8 +440,14 @@ public:
         for (size_t layer = 0; layer < m_num_layers; ++layer) {
             const auto key_segment = layout.get_key_segment(layer);
             const auto value_segment = layout.get_value_segment(layer);
-            copy_block_from_tensor(block_data.data() + key_segment.offset, m_key_cache[layer], block_id, key_segment.size);
-            copy_block_from_tensor(block_data.data() + value_segment.offset, m_value_cache[layer], block_id, value_segment.size);
+            if (m_chunked_kv_cache) {
+                const size_t chunk_id = chunk_id_of(block_id), local_id = local_block_id_of(block_id);
+                copy_block_from_tensor(block_data.data() + key_segment.offset, m_key_chunks[layer][chunk_id], local_id, key_segment.size);
+                copy_block_from_tensor(block_data.data() + value_segment.offset, m_value_chunks[layer][chunk_id], local_id, value_segment.size);
+            } else {
+                copy_block_from_tensor(block_data.data() + key_segment.offset, m_key_cache[layer], block_id, key_segment.size);
+                copy_block_from_tensor(block_data.data() + value_segment.offset, m_value_cache[layer], block_id, value_segment.size);
+            }
         }
         return block_data;
     }
@@ -334,8 +468,14 @@ public:
         for (size_t layer = 0; layer < m_num_layers; ++layer) {
             const auto key_segment = layout.get_key_segment(layer);
             const auto value_segment = layout.get_value_segment(layer);
-            copy_block_to_tensor(m_key_cache[layer], block_id, block_data.data() + key_segment.offset, key_segment.size);
-            copy_block_to_tensor(m_value_cache[layer], block_id, block_data.data() + value_segment.offset, value_segment.size);
+            if (m_chunked_kv_cache) {
+                const size_t chunk_id = chunk_id_of(block_id), local_id = local_block_id_of(block_id);
+                copy_block_to_tensor(m_key_chunks[layer][chunk_id], local_id, block_data.data() + key_segment.offset, key_segment.size);
+                copy_block_to_tensor(m_value_chunks[layer][chunk_id], local_id, block_data.data() + value_segment.offset, value_segment.size);
+            } else {
+                copy_block_to_tensor(m_key_cache[layer], block_id, block_data.data() + key_segment.offset, key_segment.size);
+                copy_block_to_tensor(m_value_cache[layer], block_id, block_data.data() + value_segment.offset, value_segment.size);
+            }
         }
     }
 
@@ -371,6 +511,18 @@ public:
                    flat_blocks_data.size(),
                    m_device.c_str(),
                    m_context ? "true" : "false");
+
+        if (m_chunked_kv_cache) {
+            // Contiguous-run coalescing assumes same-tensor adjacency, which doesn't hold across a chunk
+            // boundary; this path is disk-offload-only and already mutually exclusive with chunking (see
+            // SchedulerConfig::validate()), so just fall back to per-block writes rather than special-casing.
+            for (size_t i = 0; i < block_ids.size(); ++i) {
+                std::vector<uint8_t> single_block(flat_blocks_data.begin() + i * slot_size,
+                                                  flat_blocks_data.begin() + (i + 1) * slot_size);
+                write_block(block_ids[i], single_block);
+            }
+            return;
+        }
 
         std::vector<uint8_t> scratch;  // reused across runs/layers to avoid repeated allocation
         size_t run_start = 0;
@@ -526,6 +678,10 @@ public:
     }
 
     void copy_blocks(const std::map<size_t, std::list<size_t>>& block_copy_map) override {
+        if (m_chunked_kv_cache) {
+            copy_chunked_blocks(block_copy_map);
+            return;
+        }
         size_t copied_blocks = 0;
         for (const auto & blocks_pair : block_copy_map) {
             size_t src_block_id = blocks_pair.first;
@@ -595,8 +751,57 @@ public:
         for (size_t decoder_layer_id = 0; decoder_layer_id < m_num_layers; ++decoder_layer_id) {
             m_key_cache[decoder_layer_id] = ov::Tensor();
             m_value_cache[decoder_layer_id] = ov::Tensor();
+            if (m_chunked_kv_cache) {
+                m_key_chunks[decoder_layer_id].clear();
+                m_value_chunks[decoder_layer_id].clear();
+                m_chunk_base_ptrs[decoder_layer_id] = ov::Tensor();
+            }
         }
         m_num_allocated_kv_blocks = 0;
+    }
+
+private:
+    // Requires all four chunks to be USM device allocations (guaranteed: chunked mode only allocates
+    // via m_context.create_tensor(), asserted GPU-only at construction time), so no CPU/host fallback
+    // path is needed here unlike the legacy copy_blocks() above.
+    void copy_chunked_blocks(const std::map<size_t, std::list<size_t>>& block_copy_map) {
+        size_t copied_blocks = 0;
+        for (const auto& blocks_pair : block_copy_map) {
+            size_t src_block_id = blocks_pair.first;
+            const std::list<size_t>& dst_block_ids = blocks_pair.second;
+            for (size_t dst_block_id : dst_block_ids) {
+                ++copied_blocks;
+                const size_t src_chunk = chunk_id_of(src_block_id), src_local = local_block_id_of(src_block_id);
+                const size_t dst_chunk = chunk_id_of(dst_block_id), dst_local = local_block_id_of(dst_block_id);
+                for (size_t decoder_layer_id = 0; decoder_layer_id < m_num_layers; ++decoder_layer_id) {
+                    ov::Tensor& key_src_chunk = m_key_chunks[decoder_layer_id][src_chunk];
+                    ov::Tensor& key_dst_chunk = m_key_chunks[decoder_layer_id][dst_chunk];
+                    ov::Tensor& value_src_chunk = m_value_chunks[decoder_layer_id][src_chunk];
+                    ov::Tensor& value_dst_chunk = m_value_chunks[decoder_layer_id][dst_chunk];
+
+                    ov::Shape key_shape = key_src_chunk.get_shape();
+                    ov::Coordinate key_src_start(key_shape.size(), 0), key_src_end = key_shape;
+                    ov::Coordinate key_dst_start(key_shape.size(), 0), key_dst_end = key_shape;
+                    key_src_end[0] = (key_src_start[0] = src_local) + 1;
+                    key_dst_end[0] = (key_dst_start[0] = dst_local) + 1;
+                    ov::RemoteTensor(key_src_chunk, key_src_start, key_src_end)
+                        .copy_to(ov::RemoteTensor(key_dst_chunk, key_dst_start, key_dst_end));
+
+                    ov::Shape value_shape = value_src_chunk.get_shape();
+                    ov::Coordinate value_src_start(value_shape.size(), 0), value_src_end = value_shape;
+                    ov::Coordinate value_dst_start(value_shape.size(), 0), value_dst_end = value_shape;
+                    value_src_end[0] = (value_src_start[0] = src_local) + 1;
+                    value_dst_end[0] = (value_dst_start[0] = dst_local) + 1;
+                    ov::RemoteTensor(value_src_chunk, value_src_start, value_src_end)
+                        .copy_to(ov::RemoteTensor(value_dst_chunk, value_dst_start, value_dst_end));
+                }
+            }
+        }
+        if (copied_blocks > 0) {
+            GENAI_INFO("[KV_TRACE] copy_chunked_physical_blocks count=%zu allocated_blocks=%zu",
+                       copied_blocks,
+                       m_num_allocated_kv_blocks);
+        }
     }
 };
 
