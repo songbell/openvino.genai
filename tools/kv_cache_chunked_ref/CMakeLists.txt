@@ -19,4 +19,6 @@ find_package(OpenVINOGenAI REQUIRED)
 
 add_executable(kv_cache_chunked_ref kv_cache_chunked_ref.cpp)
 target_link_libraries(kv_cache_chunked_ref PRIVATE openvino::genai)
-set_target_properties(kv_cache_chunked_ref PROPERTIES INSTALL_RPATH_USE_LINK_PATH ON)
+set_target_properties(kv_cache_chunked_ref PROPERTIES
+    INSTALL_RPATH_USE_LINK_PATH ON
+    RUNTIME_OUTPUT_DIRECTORY /home/openvino-ci-97/bell/openvino.genai/build/bin)

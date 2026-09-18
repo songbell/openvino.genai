@@ -7,7 +7,10 @@
 // chunked_kv_cache_kernel_optimization_handoff.md.
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "openvino/genai/continuous_batching_pipeline.hpp"
@@ -16,20 +19,35 @@
 namespace {
 
 void print_usage(const char* argv0) {
-    std::cout << "Usage: " << argv0 << " <MODEL_DIR> \"<PROMPT>\" [DEVICE] [CHUNKED=0|1] [CHUNK_SIZE_BLOCKS] [MAX_NEW_TOKENS]\n"
-              << "  DEVICE             default: GPU\n"
-              << "  CHUNKED            default: 1 (use_chunked_kv_cache)\n"
-              << "  CHUNK_SIZE_BLOCKS  default: 16 (kv_cache_chunk_size_blocks)\n"
-              << "  MAX_NEW_TOKENS     default: 128\n";
+    std::cout << "Usage: " << argv0 << " <MODEL_DIR> <PROMPT|PROMPT_FILE> [DEVICE] [CHUNKED=0|1] [CHUNK_SIZE_BLOCKS] [MAX_NEW_TOKENS]\n"
+              << "  PROMPT|PROMPT_FILE  literal prompt text, or a path to a file containing the prompt\n"
+              << "  DEVICE              default: GPU\n"
+              << "  CHUNKED             default: 1 (use_chunked_kv_cache)\n"
+              << "  CHUNK_SIZE_BLOCKS   default: 16 (kv_cache_chunk_size_blocks)\n"
+              << "  MAX_NEW_TOKENS      default: 128\n";
+}
+
+std::string resolve_prompt(const std::string& prompt_or_path) {
+    if (!std::filesystem::is_regular_file(prompt_or_path)) {
+        return prompt_or_path;
+    }
+    std::ifstream file(prompt_or_path);
+    OPENVINO_ASSERT(file.is_open(), "Failed to open prompt file '", prompt_or_path, "'");
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
 }
 
 ov::genai::SchedulerConfig make_scheduler_config(bool use_chunked_kv_cache, size_t chunk_size_blocks) {
     ov::genai::SchedulerConfig config;
+    if (!use_chunked_kv_cache) {
+        return config;
+    }
     config.num_kv_blocks = 0;  // let the scheduler grow the cache dynamically
-    config.max_num_batched_tokens = 512;
+    config.max_num_batched_tokens = 4096;
     config.max_num_seqs = 2;
     config.dynamic_split_fuse = false;
-    config.use_chunked_kv_cache = use_chunked_kv_cache;
+    config.use_chunked_kv_cache = true;
     config.kv_cache_chunk_size_blocks = chunk_size_blocks;
     return config;
 }
@@ -43,13 +61,14 @@ int main(int argc, char* argv[]) try {
     }
 
     const std::string models_path = argv[1];
-    const std::string prompt = argv[2];
+    const std::string prompt = resolve_prompt(argv[2]);
     const std::string device = argc > 3 ? argv[3] : "GPU";
     const bool use_chunked_kv_cache = argc > 4 ? std::stoi(argv[4]) != 0 : true;
     const size_t chunk_size_blocks = argc > 5 ? static_cast<size_t>(std::stoul(argv[5])) : 16;
     const size_t max_new_tokens = argc > 6 ? static_cast<size_t>(std::stoul(argv[6])) : 128;
 
     std::cout << "Model: " << models_path << "\n"
+              << "Prompt length, chars: " << prompt.size() << "\n"
               << "Device: " << device << "\n"
               << "use_chunked_kv_cache: " << std::boolalpha << use_chunked_kv_cache << "\n"
               << "kv_cache_chunk_size_blocks: " << chunk_size_blocks << "\n"
