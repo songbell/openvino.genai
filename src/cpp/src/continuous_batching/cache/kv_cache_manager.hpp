@@ -784,16 +784,16 @@ private:
                     ov::Coordinate key_dst_start(key_shape.size(), 0), key_dst_end = key_shape;
                     key_src_end[0] = (key_src_start[0] = src_local) + 1;
                     key_dst_end[0] = (key_dst_start[0] = dst_local) + 1;
-                    ov::RemoteTensor(key_src_chunk, key_src_start, key_src_end)
-                        .copy_to(ov::RemoteTensor(key_dst_chunk, key_dst_start, key_dst_end));
+                    ov::RemoteTensor key_dst_roi(key_dst_chunk, key_dst_start, key_dst_end);
+                    ov::RemoteTensor(key_src_chunk, key_src_start, key_src_end).copy_to(key_dst_roi);
 
                     ov::Shape value_shape = value_src_chunk.get_shape();
                     ov::Coordinate value_src_start(value_shape.size(), 0), value_src_end = value_shape;
                     ov::Coordinate value_dst_start(value_shape.size(), 0), value_dst_end = value_shape;
                     value_src_end[0] = (value_src_start[0] = src_local) + 1;
                     value_dst_end[0] = (value_dst_start[0] = dst_local) + 1;
-                    ov::RemoteTensor(value_src_chunk, value_src_start, value_src_end)
-                        .copy_to(ov::RemoteTensor(value_dst_chunk, value_dst_start, value_dst_end));
+                    ov::RemoteTensor value_dst_roi(value_dst_chunk, value_dst_start, value_dst_end);
+                    ov::RemoteTensor(value_src_chunk, value_src_start, value_src_end).copy_to(value_dst_roi);
                 }
             }
         }
