@@ -7,8 +7,10 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <string>
 
 #include "openvino/genai/cache_eviction.hpp"
+#include "openvino/genai/cache_offload.hpp"
 #include "openvino/genai/sparse_attention.hpp"
 
 namespace ov::genai {
@@ -29,6 +31,17 @@ struct SchedulerConfig {
     // When both num_kv_blocks and cache_size are set, num_kv_blocks is used. 
     // When both num_kv_blocks and cache_size are equal to zero dynamic cache allocation is turned on.
     std::size_t cache_size = 0;
+
+    /**
+     * See new_plan.md Phase 5: whether the GPU KV cache is allocated as multiple fixed-size device
+     * memory chunks (instead of one tensor that is reallocated/copied every time it grows), enabling
+     * the paged_attention op's chunked addressing path. No effect on non-GPU devices.
+     */
+    bool use_chunked_kv_cache = false;
+    /**
+     * Number of physical KV cache blocks per chunk when `use_chunked_kv_cache` is enabled.
+     */
+    std::size_t kv_cache_chunk_size_blocks = 512;
 
     // total number of linear attention blocks available to scheduler logic.
     // Each block holds the full state for one sequence across all linear attention ops.
@@ -88,6 +101,16 @@ struct SchedulerConfig {
      */
     SparseAttentionConfig sparse_attention_config;
 
+    /**
+     * Whether to offload KV cache blocks that are about to be dropped from the in-memory prefix cache
+     * to a local disk file, so that a later request with the same prefix can restore them.
+     * Requires `enable_prefix_caching` and is currently not supported together with `use_cache_eviction`.
+     */
+    bool enable_kv_cache_offloading = false;
+    /** Configuration struct for the KV cache disk offload. Has effect only if `enable_kv_cache_offloading` is `true`.
+     */
+    CacheOffloadConfig cache_offload_config;
+
     std::size_t get_cache_interval(std::size_t kv_block_size) const {
         const std::size_t effective_cache_interval_multiplier =
             cache_interval_multiplier.value_or(DEFAULT_LINEAR_ATTENTION_CACHE_INTERVAL_MULTIPLIER);
@@ -103,6 +126,23 @@ struct SchedulerConfig {
     void validate() const {
         OPENVINO_ASSERT(!enable_prefix_caching || !cache_interval_multiplier.has_value() || cache_interval_multiplier.value() > 0,
                 "SchedulerConfig cache_interval_multiplier must be greater than 0 when prefix caching is enabled");
+        // Offloaded blocks are only rediscoverable through the prefix-cache block hash, and the disk slot layout
+        // assumes the single shared block table that is used when cache eviction is off.
+        OPENVINO_ASSERT(!enable_kv_cache_offloading || enable_prefix_caching,
+                "SchedulerConfig enable_kv_cache_offloading requires enable_prefix_caching to be enabled");
+        OPENVINO_ASSERT(!enable_kv_cache_offloading || !use_cache_eviction,
+                "SchedulerConfig enable_kv_cache_offloading is not supported together with use_cache_eviction");
+        OPENVINO_ASSERT(!enable_kv_cache_offloading || cache_offload_config.capacity_bytes > 0,
+                "SchedulerConfig cache_offload_config.capacity_bytes must be greater than 0 when enable_kv_cache_offloading is enabled");
+        // Chunked KV cache (see new_plan.md Phase 5) only covers the plain-generation allocation path so
+        // far: cache eviction (and its rotation), disk offloading, and prefix caching all address cache
+        // blocks by absolute physical index in ways that have not yet been made chunk-aware.
+        OPENVINO_ASSERT(!use_chunked_kv_cache || !use_cache_eviction,
+                "SchedulerConfig use_chunked_kv_cache is not yet supported together with use_cache_eviction");
+        OPENVINO_ASSERT(!use_chunked_kv_cache || !enable_prefix_caching,
+                "SchedulerConfig use_chunked_kv_cache is not yet supported together with enable_prefix_caching");
+        OPENVINO_ASSERT(!use_chunked_kv_cache || !enable_kv_cache_offloading,
+                "SchedulerConfig use_chunked_kv_cache is not yet supported together with enable_kv_cache_offloading");
     }
 
     bool operator==(const SchedulerConfig& other) const {
@@ -110,7 +150,8 @@ struct SchedulerConfig {
                cache_size == other.cache_size && num_linear_attention_blocks == other.num_linear_attention_blocks &&
                dynamic_split_fuse == other.dynamic_split_fuse && use_cache_eviction == other.use_cache_eviction &&
                max_num_seqs == other.max_num_seqs && enable_prefix_caching == other.enable_prefix_caching &&
-               cache_interval_multiplier == other.cache_interval_multiplier;
+               cache_interval_multiplier == other.cache_interval_multiplier &&
+               enable_kv_cache_offloading == other.enable_kv_cache_offloading && cache_offload_config == other.cache_offload_config;
     }
 
     /**
@@ -142,6 +183,10 @@ struct SchedulerConfig {
         oss << "  use_sparse_attention: " << std::boolalpha << use_sparse_attention << "\n";
         if (use_sparse_attention) {
             oss << sparse_attention_config.to_string() << "\n";
+        }
+        oss << "  enable_kv_cache_offloading: " << std::boolalpha << enable_kv_cache_offloading << "\n";
+        if (enable_kv_cache_offloading) {
+            oss << cache_offload_config.to_string() << "\n";
         }
         oss << " }";
         return oss.str();

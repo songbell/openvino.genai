@@ -22,6 +22,7 @@
 #include "lora/helper.hpp"
 #include "openvino/genai/text_streamer.hpp"
 #include "openvino/pass/sdpa_to_paged_attention.hpp"
+#include "logger.hpp"
 #include "utils.hpp"
 
 namespace {
@@ -79,13 +80,17 @@ void prepare_model_for_paged_attention(const std::shared_ptr<ov::Model>& model,
     const bool allow_score_aggregation = true;
     const bool allow_adaptive_rkv = scheduler_config.use_cache_eviction &&
                                     scheduler_config.cache_eviction_config.aggregation_mode == AggregationMode::ADAPTIVE_RKV;
+    const bool allow_chunked_kv_cache = scheduler_config.use_chunked_kv_cache;
 
     ov::pass::SDPAToPagedAttention(need_per_layer_kv_cache_control,
                                    need_per_layer_kv_cache_control,
                                    allow_score_aggregation,
                                    allow_cache_rotation,
                                    allow_xattention,
-                                   allow_adaptive_rkv)
+                                   allow_adaptive_rkv,
+                                   /* allow_qq_bias = */ false,
+                                   allow_chunked_kv_cache,
+                                   scheduler_config.kv_cache_chunk_size_blocks)
         .run_on_model(model);
     model->validate_nodes_and_infer_types();
     utils::apply_gather_before_matmul_transformation(model);
@@ -500,6 +505,12 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::step() {
         m_pipeline_metrics.avg_cache_usage = _get_current_running_average_cache_usage();
         _publish_linear_attention_pool_metric();
 
+        GENAI_INFO("[KV_TRACE] step scheduled_groups=%zu scheduled_tokens=%zu cache_usage=%.2f cache_bytes=%zu",
+               scheduler_output.m_scheduled_sequence_groups_ids.size(),
+               scheduler_output.m_total_num_scheduled_tokens,
+               scheduler_output.m_cache_usage,
+               scheduler_output.m_cache_size_in_bytes);
+
         const auto& sched_config = m_scheduler->get_config();
         if (sched_config.use_cache_eviction) {
             if (sched_config.cache_eviction_config.apply_rotation) {
@@ -864,8 +875,14 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::ContinuousBatch
     generate_timer.end();
 
     const auto& scheduler_config = m_scheduler->get_config();
-    // Clear cache in case of dynamic cache allocation and no prefix caching
-    if (!scheduler_config.enable_prefix_caching && scheduler_config.cache_size == 0 && scheduler_config.num_kv_blocks == 0) {
+    // Clear cache in case of dynamic cache allocation and no prefix caching. Skipped for chunked KV
+    // cache: KVCacheManager::clear() destroys the chunk tensors without unbinding the chunk_base_ptrs.N
+    // input (which still holds now-dangling USM pointers) from the compiled model's infer request --
+    // an untested path for chunked mode (its shrink/cleanup story isn't implemented yet, see new_plan.md
+    // Phase 5c) that was found to crash. Chunked caches simply keep their (small, incremental) allocation
+    // around between generate() calls instead.
+    if (!scheduler_config.enable_prefix_caching && scheduler_config.cache_size == 0 &&
+        scheduler_config.num_kv_blocks == 0 && !scheduler_config.use_chunked_kv_cache) {
         m_scheduler->clear_cache();
     }
     return results;
